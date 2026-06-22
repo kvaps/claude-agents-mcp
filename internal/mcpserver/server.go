@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/kvaps/claude-agents-mcp/internal/agents"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -50,16 +51,48 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("create_session",
-		mcp.WithDescription("Create a new background session in a directory (runs `claude --bg`). Returns the new session id."),
+		mcp.WithDescription("Create a new background session in a directory (runs `claude --bg`). With prompt set, the task is delivered and reliably submitted so the agent starts immediately (no separate send_text+Enter, no getting stuck idle). goal=true sends it as /goal."),
 		mcp.WithString("cwd", mcp.Required(), mcp.Description("working directory for the session")),
 		mcp.WithString("name", mcp.Description("display name for the session")),
 		mcp.WithBoolean("dangerous", mcp.Description("pass --dangerously-skip-permissions")),
+		mcp.WithString("prompt", mcp.Description("task to deliver and submit once the session is up (may be long/multi-line)")),
+		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		out, err := agents.Create(r.GetString("cwd", ""), r.GetString("name", ""), r.GetBool("dangerous", false))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		return mcp.NewToolResultText("created: " + out), nil
+		prompt := r.GetString("prompt", "")
+		if strings.TrimSpace(prompt) == "" {
+			return mcp.NewToolResultText("created: " + out), nil
+		}
+		short := agents.ParseShortID(out)
+		if short == "" {
+			return mcp.NewToolResultError("created session but could not parse its id from output; prompt NOT delivered:\n" + out), nil
+		}
+		if err := a.WaitReady(short, 20*time.Second); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("created %s but it never became ready; prompt NOT delivered: %v", short, err)), nil
+		}
+		if _, err := a.SubmitPrompt(short, prompt, r.GetBool("goal", false)); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("created %s but %v", short, err)), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("created %s and started the task", short)), nil
+	})
+
+	s.AddTool(mcp.NewTool("submit_prompt",
+		mcp.WithDescription("Deliver a prompt to a session and reliably submit it in one call (handles bracketed-paste for long/multi-line text, then verifies the turn actually started, retrying Enter once). Use this to (re)seed a session's task instead of send_text+send_keys. goal=true sends it as /goal."),
+		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
+		mcp.WithString("text", mcp.Required(), mcp.Description("prompt text to deliver and submit (may be long/multi-line)")),
+		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
+	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sess, err := a.Resolve(r.GetString("session", ""))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if _, err := a.SubmitPrompt(sess.Short, r.GetString("text", ""), r.GetBool("goal", false)); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText("submitted to " + sess.Short + "; turn started"), nil
 	})
 
 	s.AddTool(mcp.NewTool("rename_session",
