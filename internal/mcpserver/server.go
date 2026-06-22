@@ -163,36 +163,40 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("send_text",
-		mcp.WithDescription("Type text into a session (e.g. a prompt). submit=true presses Enter. Returns the resulting screen."),
+		mcp.WithDescription("Type text into a session (e.g. a prompt). submit=true presses Enter. Fire-and-forget by default (returns immediately); pass wait=true to block until the screen settles and return it — otherwise use read_screen to see output."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 		mcp.WithString("text", mcp.Required(), mcp.Description("text to type")),
 		mcp.WithBoolean("submit", mcp.Description("press Enter after typing (default true)")),
+		mcp.WithBoolean("wait", mcp.Description("block and return the resulting screen (default false: return immediately)")),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		sess, err := a.Resolve(r.GetString("session", ""))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		screen, err := a.SendText(sess.Short, r.GetString("text", ""), r.GetBool("submit", true))
+		wait := r.GetBool("wait", false)
+		screen, err := a.SendText(sess.Short, r.GetString("text", ""), r.GetBool("submit", true), wait)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		return mcp.NewToolResultText(screen), nil
+		return mcp.NewToolResultText(sentResult(screen, wait)), nil
 	})
 
 	s.AddTool(mcp.NewTool("send_keys",
-		mcp.WithDescription("Send a sequence of named keys, e.g. \"esc down enter\" or \"ctrl-c\". Supported: enter, esc, tab, space, backspace, delete, up, down, left, right, home, end, pageup, pagedown, ctrl-c/d/u/l/z/r."),
+		mcp.WithDescription("Send a sequence of named keys, e.g. \"esc down enter\" or \"ctrl-c\". Supported: enter, esc, tab, space, backspace, delete, up, down, left, right, home, end, pageup, pagedown, ctrl-c/d/u/l/z/r. Fire-and-forget by default; pass wait=true to block and return the screen."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 		mcp.WithString("keys", mcp.Required(), mcp.Description("comma- or space-separated key names")),
+		mcp.WithBoolean("wait", mcp.Description("block and return the resulting screen (default false: return immediately)")),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		sess, err := a.Resolve(r.GetString("session", ""))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		screen, err := a.SendKeys(sess.Short, splitKeys(r.GetString("keys", "")))
+		wait := r.GetBool("wait", false)
+		screen, err := a.SendKeys(sess.Short, splitKeys(r.GetString("keys", "")), wait)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		return mcp.NewToolResultText(screen), nil
+		return mcp.NewToolResultText(sentResult(screen, wait)), nil
 	})
 
 	s.AddTool(mcp.NewTool("send_command",
@@ -236,6 +240,15 @@ func jsonResult(v any) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	return mcp.NewToolResultText(string(b)), nil
+}
+
+// sentResult formats a send response: the screen when waiting, otherwise the
+// little that the grace read captured — or a hint to read_screen when empty.
+func sentResult(screen string, wait bool) string {
+	if wait || strings.TrimSpace(screen) != "" {
+		return screen
+	}
+	return "sent (fire-and-forget; call read_screen to see output, or pass wait=true)"
 }
 
 func splitKeys(s string) []string {

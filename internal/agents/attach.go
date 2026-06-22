@@ -78,11 +78,21 @@ func readSettle(conn net.Conn, seed []byte, idle, maxWait time.Duration) []byte 
 	}
 }
 
-// SendBytes attaches to a session's PTY, writes data as keystrokes, reads the
-// resulting output until it settles (capped at maxWait), and returns the screen
-// as plain text. Attach is additive (co-attach), so it does not disturb other
-// viewers of the session.
-func (c *Client) SendBytes(short string, data []byte, maxWait time.Duration) (string, error) {
+// graceGap/graceCap bound the tiny read after a fire-and-forget write: just
+// long enough to flush the keystrokes and catch any immediate echo, returning
+// as soon as the stream is quiet for graceGap.
+const (
+	graceGap = 40 * time.Millisecond
+	graceCap = 90 * time.Millisecond
+)
+
+// send attaches to a session's PTY and writes data as keystrokes. When wait is
+// false it returns right after a tiny grace read (fire-and-forget — the hot
+// path), never blocking on the read window; callers use read_screen to see the
+// result. When wait is true it drains the initial repaint, writes, then reads
+// until the screen settles (capped at maxWait) and returns the screen text.
+// Attach is additive (co-attach), so it does not disturb other viewers.
+func (c *Client) send(short string, data []byte, wait bool, maxWait time.Duration) (string, error) {
 	if strings.TrimSpace(short) == "" {
 		return "", fmt.Errorf("session is not running (no live attach target)")
 	}
@@ -90,7 +100,7 @@ func (c *Client) SendBytes(short string, data []byte, maxWait time.Duration) (st
 	if err != nil {
 		return "", err
 	}
-	conn, err := net.DialTimeout("unix", sock, 3*time.Second)
+	conn, err := net.DialTimeout("unix", sock, 2*time.Second)
 	if err != nil {
 		return "", err
 	}
@@ -109,7 +119,7 @@ func (c *Client) SendBytes(short string, data []byte, maxWait time.Duration) (st
 		return "", err
 	}
 
-	ackLine, rest, err := readLine(conn, 5*time.Second)
+	ackLine, rest, err := readLine(conn, 1500*time.Millisecond)
 	if err != nil && len(ackLine) == 0 {
 		return "", fmt.Errorf("attach: no ack: %w", err)
 	}
@@ -122,17 +132,26 @@ func (c *Client) SendBytes(short string, data []byte, maxWait time.Duration) (st
 		return "", fmt.Errorf("attach rejected: %s", ack.Error)
 	}
 
-	// Drain the initial screen repaint (rest holds any bytes after the ack)
-	// until it settles, so it isn't mixed into the response below.
-	_ = readSettle(conn, rest, settleGap, 350*time.Millisecond)
+	if !wait {
+		// Fire-and-forget: write and return after a tiny grace read. No initial
+		// drain — keystrokes reach the PTY the moment we're attached.
+		if len(data) > 0 {
+			if _, err := conn.Write(data); err != nil {
+				return "", err
+			}
+		}
+		return StripANSI(string(readSettle(conn, nil, graceGap, graceCap))), nil
+	}
 
+	// Wait mode: drain the initial repaint so it isn't mixed into the response,
+	// write, then read until the screen settles.
+	_ = readSettle(conn, rest, settleGap, 150*time.Millisecond)
 	if len(data) > 0 {
 		if _, err := conn.Write(data); err != nil {
 			return "", err
 		}
 	}
-	out := readSettle(conn, nil, settleGap, maxWait)
-	return StripANSI(string(out)), nil
+	return StripANSI(string(readSettle(conn, nil, settleGap, maxWait))), nil
 }
 
 // ReadScreen returns the current screen of a session as plain text.
@@ -147,17 +166,20 @@ func (c *Client) ReadScreen(short string, tail int) (string, error) {
 	return StripANSI(screen), nil
 }
 
-// SendText types text into the session, optionally submitting with Enter.
-func (c *Client) SendText(short, text string, submit bool) (string, error) {
+// SendText types text into the session, optionally submitting with Enter. It
+// is fire-and-forget by default (returns immediately); pass wait=true to block
+// until the screen settles and return it.
+func (c *Client) SendText(short, text string, submit, wait bool) (string, error) {
 	data := []byte(text)
 	if submit {
 		data = append(data, '\r')
 	}
-	return c.SendBytes(short, data, 1000*time.Millisecond)
+	return c.send(short, data, wait, 1000*time.Millisecond)
 }
 
-// SendKeys sends a sequence of named keys (e.g. "esc", "down", "ctrl-c").
-func (c *Client) SendKeys(short string, keys []string) (string, error) {
+// SendKeys sends a sequence of named keys (e.g. "esc", "down", "ctrl-c"). It is
+// fire-and-forget by default; pass wait=true to block and return the screen.
+func (c *Client) SendKeys(short string, keys []string, wait bool) (string, error) {
 	var data []byte
 	for _, k := range keys {
 		b, err := KeyBytes(k)
@@ -166,23 +188,25 @@ func (c *Client) SendKeys(short string, keys []string) (string, error) {
 		}
 		data = append(data, b...)
 	}
-	return c.SendBytes(short, data, 600*time.Millisecond)
+	return c.send(short, data, wait, 600*time.Millisecond)
 }
 
 // SendCommand runs a slash command reliably: it clears any open modal, waits
-// for the session to be idle, then types the command and submits it.
+// for the session to be idle, then types the command and submits it. The Esc
+// is fire-and-forget; the submit waits briefly so the returned screen reflects
+// the command landing.
 func (c *Client) SendCommand(short, command string) (string, error) {
 	cmd := strings.TrimSpace(command)
 	if !strings.HasPrefix(cmd, "/") {
 		cmd = "/" + cmd
 	}
-	if _, err := c.SendBytes(short, []byte("\x1b"), 250*time.Millisecond); err != nil {
+	if _, err := c.send(short, []byte("\x1b"), false, 0); err != nil {
 		return "", err
 	}
 	if err := c.WaitIdle(short, 30*time.Second); err != nil {
 		return "", err
 	}
-	return c.SendBytes(short, append([]byte(cmd), '\r'), 1500*time.Millisecond)
+	return c.send(short, append([]byte(cmd), '\r'), true, 800*time.Millisecond)
 }
 
 // Cancel interrupts the current task: Esc by default, Ctrl-C when hard.
@@ -191,5 +215,5 @@ func (c *Client) Cancel(short string, hard bool) (string, error) {
 	if hard {
 		key = []byte("\x03")
 	}
-	return c.SendBytes(short, key, 600*time.Millisecond)
+	return c.send(short, key, true, 500*time.Millisecond)
 }
