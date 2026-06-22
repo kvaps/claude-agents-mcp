@@ -32,7 +32,8 @@ Session management:
 
 - `list_sessions` — every session the agents view shows, **including not-running ones** (`live:false`); running ones carry live state (`state`, `tempo`, `detail`, `needs`), short id, `cwd`, `name`, and a `pinned` flag. `live_only=true` filters to running sessions
 - `get_session` — one session by short id / session id / name
-- `create_session` — `claude --bg` in a directory (optional name, dangerous mode)
+- `create_session` — `claude --bg` in a directory (optional name, dangerous mode); with `prompt` it delivers and reliably submits the task so the agent starts immediately (`goal=true` sends it as `/goal`)
+- `submit_prompt` — deliver a prompt to a session and reliably submit it in one call (handles long/multi-line bracketed-paste, verifies the turn started, retries Enter once); `goal=true` sends `/goal`
 - `rename_session` — set a session's custom title (`ctrl+r` in the agents view)
 - `pin_session` — pin / unpin a session so it sorts to the top (`ctrl+t` in the agents view)
 - `reorder_session` — move a running session up/down or to an absolute slot (`shift+↑/↓` in the agents view)
@@ -41,8 +42,8 @@ Session management:
 Attach — everything a human can do inside a session:
 
 - `read_screen` — current screen as plain text
-- `send_text` — type text / submit a prompt
-- `send_keys` — named keys: `enter esc tab space backspace delete up down left right home end pageup pagedown ctrl-c ctrl-d ctrl-u ctrl-l ctrl-z ctrl-r`
+- `send_text` — type text into a session (fire-and-forget by default; `wait=true` blocks and returns the settled screen)
+- `send_keys` — named keys (fire-and-forget; `wait=true` to block): `enter esc tab space backspace delete up down left right home end pageup pagedown ctrl-c ctrl-d ctrl-u ctrl-l ctrl-z ctrl-r`
 - `send_command` — run a slash command reliably (clears modals → waits for idle → types → submits): `/remote-control`, `/goal`, `/compact`, …
 - `cancel` — interrupt the current task (Esc, or Ctrl-C with `hard=true`)
 
@@ -52,7 +53,8 @@ Attach — everything a human can do inside a session:
 
 - [x] List sessions, including not-running ones (`--all`), with a `live` flag and live state (`state`/`tempo`/`detail`/`needs`/`cwd`/`name`)
 - [x] Get a single session
-- [x] Create a session (`claude --bg`)
+- [x] Create a session (`claude --bg`), optionally delivering + submitting a starting prompt (or `/goal`)
+- [x] Reliably deliver + submit a prompt (`submit_prompt`): bracketed-paste for long/multi-line, verify the turn started
 - [x] Rename a session (`ctrl+r`; custom title via `.meta.json` sidecar)
 - [x] Pin / unpin a session (`ctrl+t`; agents-view pin set in `~/.claude/jobs/pins.json`)
 - [x] Reorder a session up/down or to an absolute slot (`shift+↑/↓`; sort keys in `~/.claude/jobs/<id>/order`)
@@ -73,7 +75,7 @@ Attach — everything a human can do inside a session:
 - [ ] Real-time bidirectional interactive bridge (hand a live session to a human/agent)
 - [ ] Rename reflected in the live daemon roster `name` (today it sets the custom title; the roster name stays the spawn name)
 - [ ] Multi-attacher resize / repaint coordination
-- [ ] `op:dispatch` create with a starting prompt and agent/model/effort overrides (today create goes through `claude --bg`)
+- [ ] `op:dispatch` create with agent/model/effort overrides (today create goes through `claude --bg`; a starting prompt is delivered over the PTY rather than seeded at dispatch)
 
 ## How it works
 
