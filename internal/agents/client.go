@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -161,11 +162,28 @@ func markPinned(sessions []Session) []Session {
 	return sessions
 }
 
+// idRef matches an 8-hex short id or a full session UUID — references that can
+// be resolved from the daemon roster alone, without the slower CLI enrichment.
+var idRef = regexp.MustCompile(`^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})?$`)
+
 // Resolve finds a session by exact short id / session id / name, then falls
 // back to a short-id or session-id prefix match.
 func (c *Client) Resolve(ref string) (Session, error) {
 	if ref == "" {
 		return Session{}, fmt.Errorf("empty session reference")
+	}
+	// Fast path: a short id or full session id is resolvable from the daemon
+	// roster alone (one socket round-trip), skipping `claude agents --json`.
+	// Names and not-running sessions still need the full, enriched list below.
+	if idRef.MatchString(ref) {
+		if live, lerr := c.listDaemon(); lerr == nil {
+			for _, j := range live {
+				if j.Short == ref || j.SessionID == ref {
+					j.Live = true
+					return j, nil
+				}
+			}
+		}
 	}
 	jobs, err := c.List()
 	if err != nil {
