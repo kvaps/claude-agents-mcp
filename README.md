@@ -30,10 +30,12 @@ The server speaks MCP over stdio.
 
 Session management:
 
-- `list_sessions` — every session the agents view shows, **including not-running ones** (`live:false`); running ones carry live state (`state`, `tempo`, `detail`, `needs`), short id, `cwd`, `name`. `live_only=true` filters to running sessions
+- `list_sessions` — every session the agents view shows, **including not-running ones** (`live:false`); running ones carry live state (`state`, `tempo`, `detail`, `needs`), short id, `cwd`, `name`, and a `pinned` flag. `live_only=true` filters to running sessions
 - `get_session` — one session by short id / session id / name
 - `create_session` — `claude --bg` in a directory (optional name, dangerous mode)
 - `rename_session` — set a session's custom title (`ctrl+r` in the agents view)
+- `pin_session` — pin / unpin a session so it sorts to the top (`ctrl+t` in the agents view)
+- `reorder_session` — move a running session up/down or to an absolute slot (`shift+↑/↓` in the agents view)
 - `delete_session` — `claude rm` (permanent, `ctrl+x` in the agents view) or `claude stop` (graceful)
 
 Attach — everything a human can do inside a session:
@@ -52,6 +54,8 @@ Attach — everything a human can do inside a session:
 - [x] Get a single session
 - [x] Create a session (`claude --bg`)
 - [x] Rename a session (`ctrl+r`; custom title via `.meta.json` sidecar)
+- [x] Pin / unpin a session (`ctrl+t`; agents-view pin set in `~/.claude/jobs/pins.json`)
+- [x] Reorder a session up/down or to an absolute slot (`shift+↑/↓`; sort keys in `~/.claude/jobs/<id>/order`)
 - [x] Delete a session (`ctrl+x` remove / graceful stop)
 - [x] Read a session's screen
 - [x] Type text / submit prompts
@@ -62,8 +66,6 @@ Attach — everything a human can do inside a session:
 
 ### Not yet — wanted
 
-- [ ] Pin / unpin sessions (`ctrl+t` in the agents view) — pin is daemon-side `state.pinned`, set by a control op the agents-view picker sends; the op's exact schema isn't captured yet (the daemon rejects guessed payloads with `malformed request`). Needs a one-time capture of the real pin request.
-- [ ] Reorder sessions (`shift+↑/↓` in the agents view) — same daemon-side ordering mechanism / op-capture gap as pin.
 - [ ] Full VT terminal emulation for `read_screen` (today it ANSI-strips the PTY tail, so wrapped/redrawn TUI screens render imperfectly — not a true cell grid)
 - [ ] Live streaming / subscribe tool (push updates as a session changes; today `read_screen` is a pull/snapshot)
 - [ ] Structured detection of permission prompts + a high-level "answer the prompt" tool
@@ -78,6 +80,7 @@ Attach — everything a human can do inside a session:
 - `list` uses the daemon control op `list` for rich state, enriched with `claude agents --json` for the display name and worktree `cwd` (which `op:list` omits).
 - attach actions open the daemon's `op:attach` raw PTY stream and write keystrokes — the exact same channel as the human keyboard. Reads come back from the same stream (or `op:subscribe` for `read_screen`).
 - create / stop / remove shell out to the stable public `claude` CLI.
+- pin / reorder are **not** daemon ops — the agents-view picker keeps them on disk under `~/.claude/jobs`: the pin set in `pins.json` (a JSON array of short ids, written under a lock) and per-session sort keys in `<id>/order` and `<id>/stateOrder`. `pin_session` / `reorder_session` write exactly those files, so the change is durable and any picker reflects it.
 
 Slash commands only work over the raw PTY (`op:attach`): they are REPL input, not conversation messages, so they cannot be delivered through any message/dispatch channel.
 
