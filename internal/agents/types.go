@@ -9,7 +9,7 @@ type Session struct {
 	Cwd       string `json:"cwd"`
 	Backend   string `json:"backend"`
 	Tempo     string `json:"tempo"`  // idle | active | blocked
-	State     string `json:"state"`  // working | blocked | done | ...
+	State     string `json:"state"`  // running | working | blocked | done
 	Detail    string `json:"detail"` // live human-readable status
 	Intent    string `json:"intent"`
 	Name      string `json:"name"`
@@ -19,7 +19,12 @@ type Session struct {
 	Live      bool   `json:"live"` // true if a live daemon worker (attachable); false for not-running sessions
 }
 
-// Busy reports whether the session is actively working (so input should wait).
+// Busy reports whether the session is actively processing a turn, so input
+// should wait. It keys off state, not tempo: tempo=="active" only means the
+// session produced output recently and is set even when it is idle at the
+// prompt — a freshly-booted session sits there with tempo=active/state=running,
+// and a just-finished one reports tempo=active/state=done. Neither is busy;
+// only state=="working" means a turn is actually in flight.
 func (s Session) Busy() bool {
-	return s.Tempo == "active" || s.State == "working"
+	return s.State == "working"
 }
