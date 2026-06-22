@@ -111,7 +111,7 @@ func (c *Client) List() ([]Session, error) {
 			s.Live = true
 			out = append(out, s)
 		}
-		return out, nil
+		return markPinned(out), nil
 	}
 
 	out := make([]Session, 0, len(all))
@@ -144,7 +144,21 @@ func (c *Client) List() ([]Session, error) {
 			out = append(out, s)
 		}
 	}
-	return out, nil
+	return markPinned(out), nil
+}
+
+// markPinned flags sessions present in the agents-view pin set (pins.json).
+func markPinned(sessions []Session) []Session {
+	pins := PinnedSet()
+	if len(pins) == 0 {
+		return sessions
+	}
+	for i := range sessions {
+		if pins[sessions[i].Short] {
+			sessions[i].Pinned = true
+		}
+	}
+	return sessions
 }
 
 // Resolve finds a session by exact short id / session id / name, then falls

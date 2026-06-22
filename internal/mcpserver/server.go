@@ -98,6 +98,52 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		return mcp.NewToolResultText("closed " + sess.Short), nil
 	})
 
+	s.AddTool(mcp.NewTool("pin_session",
+		mcp.WithDescription("Pin or unpin a session in the agents view (ctrl+t). Pinned sessions sort to the top of the list. pinned=true pins, pinned=false unpins."),
+		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
+		mcp.WithBoolean("pinned", mcp.Description("true to pin (default), false to unpin")),
+	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sess, err := a.Resolve(r.GetString("session", ""))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		pinned := r.GetBool("pinned", true)
+		if err := a.Pin(sess.Short, pinned); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		verb := "pinned"
+		if !pinned {
+			verb = "unpinned"
+		}
+		return mcp.NewToolResultText(verb + " " + sess.Short), nil
+	})
+
+	s.AddTool(mcp.NewTool("reorder_session",
+		mcp.WithDescription("Reorder a running session in the agents view (shift+up/down). Use direction=up/down to move one slot, or position for a 0-based absolute slot. Only running daemon sessions can be reordered; pinning takes precedence over ordering."),
+		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
+		mcp.WithString("direction", mcp.Description("\"up\" or \"down\" (move one slot)")),
+		mcp.WithNumber("position", mcp.Description("0-based target slot (overrides direction)")),
+	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sess, err := a.Resolve(r.GetString("session", ""))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		direction := strings.ToLower(strings.TrimSpace(r.GetString("direction", "")))
+		_, hasPosition := r.GetArguments()["position"]
+		position := r.GetInt("position", 0)
+		if !hasPosition && direction == "" {
+			return mcp.NewToolResultError("provide direction (\"up\"/\"down\") or position"), nil
+		}
+		if err := a.Reorder(sess.Short, direction, position, hasPosition); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		where := direction
+		if hasPosition {
+			where = fmt.Sprintf("position %d", position)
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("reordered %s (%s)", sess.Short, where)), nil
+	})
+
 	// ---- attach: everything a human can do inside a session ----
 
 	s.AddTool(mcp.NewTool("read_screen",
