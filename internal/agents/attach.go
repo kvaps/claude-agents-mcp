@@ -37,50 +37,52 @@ func readLine(conn net.Conn, timeout time.Duration) (line, rest []byte, err erro
 	}
 }
 
-// drainQuiet reads (and keeps) bytes until no data arrives for quiet.
-func drainQuiet(conn net.Conn, seed []byte, quiet time.Duration) []byte {
+// settleGap is how long the PTY must be silent before output is considered
+// settled. Reads return one gap after the last byte, so a redraw that finishes
+// quickly is returned promptly instead of waiting out a fixed window.
+const settleGap = 100 * time.Millisecond
+
+// readSettle reads bytes until the stream stays quiet for idle, or until
+// maxWait elapses as a hard backstop, returning everything read. This lets a
+// call return as soon as the terminal stops drawing (the common case) while
+// still bounding the wait when a session keeps repainting (e.g. a spinner).
+func readSettle(conn net.Conn, seed []byte, idle, maxWait time.Duration) []byte {
 	out := append([]byte{}, seed...)
+	deadline := time.Now().Add(maxWait)
 	tmp := make([]byte, 8192)
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(quiet))
+		now := time.Now()
+		if !now.Before(deadline) {
+			return out
+		}
+		wait := idle
+		if d := deadline.Sub(now); d < wait {
+			wait = d
+		}
+		_ = conn.SetReadDeadline(now.Add(wait))
 		n, e := conn.Read(tmp)
 		if n > 0 {
 			out = append(out, tmp[:n]...)
 			continue
 		}
-		_ = e
-		return out
-	}
-}
-
-// readFor reads bytes for the given total duration, returning everything read.
-func readFor(conn net.Conn, seed []byte, total time.Duration) []byte {
-	out := append([]byte{}, seed...)
-	deadline := time.Now().Add(total)
-	tmp := make([]byte, 8192)
-	for {
-		remain := time.Until(deadline)
-		if remain <= 0 {
-			return out
-		}
-		_ = conn.SetReadDeadline(time.Now().Add(min(remain, 300*time.Millisecond)))
-		n, e := conn.Read(tmp)
-		if n > 0 {
-			out = append(out, tmp[:n]...)
-		}
 		if e != nil {
 			if ne, ok := e.(net.Error); ok && ne.Timeout() {
-				continue
+				if wait >= idle {
+					return out // a full idle gap with no data: settled
+				}
+				continue // gap was clipped by the backstop; next loop hits it
 			}
-			return out
+			return out // EOF or a real error
 		}
+		return out // no data, no error (unusual): don't spin
 	}
 }
 
 // SendBytes attaches to a session's PTY, writes data as keystrokes, reads the
-// resulting output for readDur, and returns the screen as plain text. Attach is
-// additive (co-attach), so it does not disturb other viewers of the session.
-func (c *Client) SendBytes(short string, data []byte, readDur time.Duration) (string, error) {
+// resulting output until it settles (capped at maxWait), and returns the screen
+// as plain text. Attach is additive (co-attach), so it does not disturb other
+// viewers of the session.
+func (c *Client) SendBytes(short string, data []byte, maxWait time.Duration) (string, error) {
 	if strings.TrimSpace(short) == "" {
 		return "", fmt.Errorf("session is not running (no live attach target)")
 	}
@@ -120,15 +122,16 @@ func (c *Client) SendBytes(short string, data []byte, readDur time.Duration) (st
 		return "", fmt.Errorf("attach rejected: %s", ack.Error)
 	}
 
-	// Drain the initial screen repaint (rest holds any bytes after the ack).
-	_ = drainQuiet(conn, rest, 500*time.Millisecond)
+	// Drain the initial screen repaint (rest holds any bytes after the ack)
+	// until it settles, so it isn't mixed into the response below.
+	_ = readSettle(conn, rest, settleGap, 350*time.Millisecond)
 
 	if len(data) > 0 {
 		if _, err := conn.Write(data); err != nil {
 			return "", err
 		}
 	}
-	out := readFor(conn, nil, readDur)
+	out := readSettle(conn, nil, settleGap, maxWait)
 	return StripANSI(string(out)), nil
 }
 
@@ -150,7 +153,7 @@ func (c *Client) SendText(short, text string, submit bool) (string, error) {
 	if submit {
 		data = append(data, '\r')
 	}
-	return c.SendBytes(short, data, 1500*time.Millisecond)
+	return c.SendBytes(short, data, 1000*time.Millisecond)
 }
 
 // SendKeys sends a sequence of named keys (e.g. "esc", "down", "ctrl-c").
@@ -163,7 +166,7 @@ func (c *Client) SendKeys(short string, keys []string) (string, error) {
 		}
 		data = append(data, b...)
 	}
-	return c.SendBytes(short, data, 1200*time.Millisecond)
+	return c.SendBytes(short, data, 600*time.Millisecond)
 }
 
 // SendCommand runs a slash command reliably: it clears any open modal, waits
@@ -179,7 +182,7 @@ func (c *Client) SendCommand(short, command string) (string, error) {
 	if err := c.WaitIdle(short, 30*time.Second); err != nil {
 		return "", err
 	}
-	return c.SendBytes(short, append([]byte(cmd), '\r'), 2500*time.Millisecond)
+	return c.SendBytes(short, append([]byte(cmd), '\r'), 1500*time.Millisecond)
 }
 
 // Cancel interrupts the current task: Esc by default, Ctrl-C when hard.
@@ -188,5 +191,5 @@ func (c *Client) Cancel(short string, hard bool) (string, error) {
 	if hard {
 		key = []byte("\x03")
 	}
-	return c.SendBytes(short, key, 800*time.Millisecond)
+	return c.SendBytes(short, key, 600*time.Millisecond)
 }
