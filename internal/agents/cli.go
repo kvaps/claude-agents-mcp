@@ -6,9 +6,23 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// bgShortRe extracts the new session's short id from `claude --bg` output,
+// which reads "backgrounded · <short> · <name> (idle — …)".
+var bgShortRe = regexp.MustCompile(`backgrounded[^\n]*?([0-9a-f]{8})`)
+
+// ParseShortID pulls the new session's short id out of `claude --bg` output
+// (ANSI colours and all). Returns "" if it can't be found.
+func ParseShortID(out string) string {
+	if m := bgShortRe.FindStringSubmatch(StripANSI(out)); m != nil {
+		return m[1]
+	}
+	return ""
+}
 
 // AgentInfo is the public `claude agents --json` view of a session. It carries
 // the display name, the short id, and the real (worktree) cwd, which the
