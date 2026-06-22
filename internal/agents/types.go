@@ -16,6 +16,7 @@ type Session struct {
 	Agent     string `json:"agent"`
 	Needs     string `json:"needs"` // what a blocked session is waiting on
 	StartedAt int64  `json:"startedAt"`
+	Live      bool   `json:"live"` // true if a live daemon worker (attachable); false for not-running sessions
 }
 
 // Busy reports whether the session is actively working (so input should wait).

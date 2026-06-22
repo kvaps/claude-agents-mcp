@@ -30,11 +30,11 @@ The server speaks MCP over stdio.
 
 Session management:
 
-- `list_sessions` — all background sessions with live state (`state`, `tempo`, `detail`, `needs`), `cwd`, `name`
+- `list_sessions` — every session the agents view shows, **including not-running ones** (`live:false`); running ones carry live state (`state`, `tempo`, `detail`, `needs`), short id, `cwd`, `name`. `live_only=true` filters to running sessions
 - `get_session` — one session by short id / session id / name
 - `create_session` — `claude --bg` in a directory (optional name, dangerous mode)
-- `rename_session` — set a session's custom title (same effect as renaming in the agents view)
-- `close_session` — `claude rm` (permanent) or `claude stop` (graceful)
+- `rename_session` — set a session's custom title (`ctrl+r` in the agents view)
+- `delete_session` — `claude rm` (permanent, `ctrl+x` in the agents view) or `claude stop` (graceful)
 
 Attach — everything a human can do inside a session:
 
@@ -48,11 +48,11 @@ Attach — everything a human can do inside a session:
 
 ### Implemented
 
-- [x] List sessions and live state (`state`/`tempo`/`detail`/`needs`/`cwd`/`name`)
+- [x] List sessions, including not-running ones (`--all`), with a `live` flag and live state (`state`/`tempo`/`detail`/`needs`/`cwd`/`name`)
 - [x] Get a single session
 - [x] Create a session (`claude --bg`)
-- [x] Rename a session (custom title via `.meta.json` sidecar)
-- [x] Close a session (remove / graceful stop)
+- [x] Rename a session (`ctrl+r`; custom title via `.meta.json` sidecar)
+- [x] Delete a session (`ctrl+x` remove / graceful stop)
 - [x] Read a session's screen
 - [x] Type text / submit prompts
 - [x] Send named keys (arrows, Esc, Ctrl-C, …)
@@ -60,8 +60,10 @@ Attach — everything a human can do inside a session:
 - [x] Cancel the current task (Esc / Ctrl-C)
 - [x] Apache-2.0 license, mandatory `golangci-lint` step
 
-### Not yet — wanted, currently only approximated via raw attach
+### Not yet — wanted
 
+- [ ] Pin / unpin sessions (`ctrl+t` in the agents view) — pin is daemon-side `state.pinned`, set by a control op the agents-view picker sends; the op's exact schema isn't captured yet (the daemon rejects guessed payloads with `malformed request`). Needs a one-time capture of the real pin request.
+- [ ] Reorder sessions (`shift+↑/↓` in the agents view) — same daemon-side ordering mechanism / op-capture gap as pin.
 - [ ] Full VT terminal emulation for `read_screen` (today it ANSI-strips the PTY tail, so wrapped/redrawn TUI screens render imperfectly — not a true cell grid)
 - [ ] Live streaming / subscribe tool (push updates as a session changes; today `read_screen` is a pull/snapshot)
 - [ ] Structured detection of permission prompts + a high-level "answer the prompt" tool

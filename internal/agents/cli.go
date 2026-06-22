@@ -11,22 +11,38 @@ import (
 )
 
 // AgentInfo is the public `claude agents --json` view of a session. It carries
-// the display name and the real (worktree) cwd, which the daemon's op:list omits.
+// the display name, the short id, and the real (worktree) cwd, which the
+// daemon's op:list omits. With --all it also includes not-running sessions.
 type AgentInfo struct {
+	ID        string `json:"id"` // short id (also valid for not-running sessions)
 	SessionID string `json:"sessionId"`
 	Name      string `json:"name"`
 	Cwd       string `json:"cwd"`
 	Kind      string `json:"kind"`
 	Status    string `json:"status"`
+	State     string `json:"state"`
 }
 
-// AgentsJSON returns `claude agents --json` keyed by session id.
-func AgentsJSON() (map[string]AgentInfo, error) {
+// StatusStr returns whichever status field the CLI populated.
+func (a AgentInfo) StatusStr() string {
+	if a.Status != "" {
+		return a.Status
+	}
+	return a.State
+}
+
+// AgentsJSON returns `claude agents --json` as an ordered slice. When all is
+// true it passes --all to include not-running sessions (the full agents view).
+func AgentsJSON(all bool) ([]AgentInfo, error) {
 	bin, err := claudePath()
 	if err != nil {
 		return nil, err
 	}
-	out, err := exec.Command(bin, "agents", "--json").Output()
+	args := []string{"agents", "--json"}
+	if all {
+		args = append(args, "--all")
+	}
+	out, err := exec.Command(bin, args...).Output()
 	if err != nil {
 		return nil, err
 	}
@@ -34,11 +50,7 @@ func AgentsJSON() (map[string]AgentInfo, error) {
 	if err := json.Unmarshal(out, &arr); err != nil {
 		return nil, err
 	}
-	m := make(map[string]AgentInfo, len(arr))
-	for _, a := range arr {
-		m[a.SessionID] = a
-	}
-	return m, nil
+	return arr, nil
 }
 
 // claudePath returns the path to the claude CLI.
@@ -87,10 +99,13 @@ func Create(cwd, name string, dangerous bool) (string, error) {
 // Stop gracefully stops a session (it stays in the list, idle).
 func Stop(short string) error { return runClaude("stop", short) }
 
-// Remove permanently removes a session (tombstone, no respawn).
+// Remove permanently deletes a session (tombstone, no respawn).
 func Remove(short string) error { return runClaude("rm", short) }
 
 func runClaude(sub, short string) error {
+	if short == "" {
+		return fmt.Errorf("empty session id")
+	}
 	bin, err := claudePath()
 	if err != nil {
 		return err

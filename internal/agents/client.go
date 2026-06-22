@@ -66,8 +66,9 @@ func (c *Client) request(payload map[string]any) ([]byte, error) {
 	return []byte(line), nil
 }
 
-// List returns all background sessions known to the daemon.
-func (c *Client) List() ([]Session, error) {
+// listDaemon returns the live daemon roster (op:list) with rich state. Not-
+// running sessions are not included here.
+func (c *Client) listDaemon() ([]Session, error) {
 	raw, err := c.request(map[string]any{"proto": 1, "op": "list"})
 	if err != nil {
 		return nil, err
@@ -83,23 +84,67 @@ func (c *Client) List() ([]Session, error) {
 	if !resp.OK {
 		return nil, fmt.Errorf("daemon error: %s", resp.Error)
 	}
-	// op:list omits the display name and reports the repo cwd rather than the
-	// worktree cwd; enrich both from the public agents view (best effort).
-	if info, err := AgentsJSON(); err == nil {
-		for i := range resp.Jobs {
-			a, ok := info[resp.Jobs[i].SessionID]
-			if !ok {
-				continue
-			}
-			if resp.Jobs[i].Name == "" {
-				resp.Jobs[i].Name = a.Name
+	return resp.Jobs, nil
+}
+
+// List returns every session shown in the agents view — including not-running
+// ones (via `claude agents --json --all`) — enriched with the live daemon state
+// (state/tempo/detail/needs) and short id for the running ones. The daemon's
+// op:list omits the display name and reports the repo cwd; the agents view
+// supplies the name, short id and the real worktree cwd.
+func (c *Client) List() ([]Session, error) {
+	live, lerr := c.listDaemon()
+	all, aerr := AgentsJSON(true)
+	if lerr != nil && aerr != nil {
+		return nil, lerr
+	}
+
+	rich := make(map[string]Session, len(live))
+	for _, s := range live {
+		rich[s.SessionID] = s
+	}
+
+	// No agents-view list available: return the live roster as-is.
+	if aerr != nil {
+		out := make([]Session, 0, len(live))
+		for _, s := range live {
+			s.Live = true
+			out = append(out, s)
+		}
+		return out, nil
+	}
+
+	out := make([]Session, 0, len(all))
+	for _, a := range all {
+		if r, ok := rich[a.SessionID]; ok {
+			r.Live = true
+			if r.Name == "" {
+				r.Name = a.Name
 			}
 			if a.Cwd != "" {
-				resp.Jobs[i].Cwd = a.Cwd
+				r.Cwd = a.Cwd
 			}
+			out = append(out, r)
+			delete(rich, a.SessionID)
+			continue
+		}
+		out = append(out, Session{
+			Short:     a.ID,
+			SessionID: a.SessionID,
+			Name:      a.Name,
+			Cwd:       a.Cwd,
+			State:     a.StatusStr(),
+			Live:      false,
+		})
+	}
+	// Any live sessions that the agents view did not list (rare): append them.
+	for _, s := range live {
+		if _, leftover := rich[s.SessionID]; leftover {
+			s.Live = true
+			out = append(out, s)
 		}
 	}
-	return resp.Jobs, nil
+	return out, nil
 }
 
 // Resolve finds a session by exact short id / session id / name, then falls
@@ -118,7 +163,10 @@ func (c *Client) Resolve(ref string) (Session, error) {
 		}
 	}
 	for _, j := range jobs {
-		if strings.HasPrefix(j.Short, ref) || strings.HasPrefix(j.SessionID, ref) {
+		if j.Short != "" && strings.HasPrefix(j.Short, ref) {
+			return j, nil
+		}
+		if strings.HasPrefix(j.SessionID, ref) {
 			return j, nil
 		}
 	}
@@ -146,6 +194,9 @@ func (c *Client) WaitIdle(short string, timeout time.Duration) error {
 // Snapshot opens a read-only subscription and returns the session record plus
 // the current screen contents (raw PTY tail joined).
 func (c *Client) Snapshot(short string, tail int) (Session, string, error) {
+	if strings.TrimSpace(short) == "" {
+		return Session{}, "", fmt.Errorf("session is not running (no live attach target)")
+	}
 	sock, err := FindSocket()
 	if err != nil {
 		return Session{}, "", err

@@ -19,11 +19,21 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	// ---- session management ----
 
 	s.AddTool(mcp.NewTool("list_sessions",
-		mcp.WithDescription("List all background `claude agents` sessions with their live state (state, tempo, detail, needs), cwd and name."),
-	), func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		mcp.WithDescription("List sessions exactly as the agents view shows them — including not-running ones (`live:false`). Running sessions carry live state (state, tempo, detail, needs) and a short id; pass live_only=true to return only running sessions."),
+		mcp.WithBoolean("live_only", mcp.Description("return only running (attachable) sessions")),
+	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		jobs, err := a.List()
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if r.GetBool("live_only", false) {
+			filtered := make([]agents.Session, 0, len(jobs))
+			for _, j := range jobs {
+				if j.Live {
+					filtered = append(filtered, j)
+				}
+			}
+			jobs = filtered
 		}
 		return jsonResult(jobs)
 	})
@@ -68,8 +78,8 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		return mcp.NewToolResultText(fmt.Sprintf("renamed %s -> %q", sess.Short, title)), nil
 	})
 
-	s.AddTool(mcp.NewTool("close_session",
-		mcp.WithDescription("Close a session. permanent=true removes it (claude rm); permanent=false stops it gracefully (claude stop)."),
+	s.AddTool(mcp.NewTool("delete_session",
+		mcp.WithDescription("Delete a session. permanent=true removes it (claude rm, like ctrl+x in the agents view); permanent=false stops it gracefully (claude stop)."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 		mcp.WithBoolean("permanent", mcp.Description("remove permanently (default true)")),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {

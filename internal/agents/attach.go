@@ -81,6 +81,9 @@ func readFor(conn net.Conn, seed []byte, total time.Duration) []byte {
 // resulting output for readDur, and returns the screen as plain text. Attach is
 // additive (co-attach), so it does not disturb other viewers of the session.
 func (c *Client) SendBytes(short string, data []byte, readDur time.Duration) (string, error) {
+	if strings.TrimSpace(short) == "" {
+		return "", fmt.Errorf("session is not running (no live attach target)")
+	}
 	sock, err := FindSocket()
 	if err != nil {
 		return "", err
