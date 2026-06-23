@@ -205,6 +205,101 @@ func (c *Client) Resolve(ref string) (Session, error) {
 	return Session{}, fmt.Errorf("no session matching %q", ref)
 }
 
+// fullSessionID matches a complete session UUID — resumable directly via
+// `claude --bg --resume` even when the session is not in the agents roster.
+var fullSessionID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// IsFullSessionID reports whether ref is a complete session UUID.
+func IsFullSessionID(ref string) bool { return fullSessionID.MatchString(ref) }
+
+// WaitLive polls the daemon roster until a freshly-resumed worker reaches and
+// holds a usable state for a settle window. `claude --bg --resume` hands back a
+// short id immediately, but the worker then boots: it may sit in "resuming"
+// (replaying history) or flicker through "crashed" while it runs its first turn
+// before settling into a normal state — and it can also simply be retired by the
+// daemon (the failure behind a resume that has "already exited" by the time you
+// attach). WaitLive treats resuming/crashed as transient states to wait through,
+// resetting the settle timer until the worker is genuinely usable. It returns:
+//   - the live session once it has held a usable state through the settle window;
+//   - a "retired" error if the worker left the roster after appearing — the
+//     caller should retry the resume from a clean slate;
+//   - a "never registered" / "did not stabilize" error otherwise.
+//
+// If the worker is usable but simply hasn't completed the settle window when the
+// overall timeout hits, it is returned without error as a best-effort live result.
+func (c *Client) WaitLive(short string, timeout, settle time.Duration) (Session, error) {
+	deadline := time.Now().Add(timeout)
+	seen := false
+	var last Session
+	var bootedAt time.Time
+	for {
+		if live, err := c.listDaemon(); err == nil {
+			var cur Session
+			found := false
+			for _, j := range live {
+				if j.Short == short {
+					j.Live = true
+					cur, found = j, true
+					break
+				}
+			}
+			switch {
+			case found:
+				seen, last = true, cur
+				if cur.Usable() {
+					if bootedAt.IsZero() {
+						bootedAt = time.Now()
+					}
+					if time.Since(bootedAt) >= settle {
+						return cur, nil // held a usable state through settle
+					}
+				} else {
+					bootedAt = time.Time{} // resuming/crashed: still booting, restart settle
+				}
+			case seen:
+				return Session{}, fmt.Errorf("resumed worker %s registered then was retired by the daemon — `claude --bg --resume` does this intermittently; retry the resume from a clean slate", short)
+			}
+		}
+		if time.Now().After(deadline) {
+			switch {
+			case seen && last.Usable():
+				return last, nil // usable, just not settled yet
+			case seen:
+				return Session{}, fmt.Errorf("resumed worker %s never stabilized within %s (last state=%q)", short, timeout, last.State)
+			default:
+				return Session{}, fmt.Errorf("resumed worker %s never registered with the daemon within %s", short, timeout)
+			}
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+}
+
+// EnsureNotLive stops any live workers for a session id and waits until none
+// remain in the daemon roster, so a (re)resume starts from a clean slate and
+// cannot collide with a leftover worker — which is what makes the daemon retire
+// one of the pair. Best-effort: it returns once the roster is clear of this
+// session or the timeout elapses.
+func (c *Client) EnsureNotLive(sessionID string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for {
+		live, err := c.listDaemon()
+		if err != nil {
+			return
+		}
+		any := false
+		for _, j := range live {
+			if j.SessionID == sessionID {
+				_ = Stop(j.Short)
+				any = true
+			}
+		}
+		if !any || time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
 // WaitIdle polls until the session is no longer actively working, or timeout.
 func (c *Client) WaitIdle(short string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)

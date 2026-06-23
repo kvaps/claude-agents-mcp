@@ -29,3 +29,26 @@ type Session struct {
 func (s Session) Busy() bool {
 	return s.State == "working"
 }
+
+// Resuming reports whether the session is still replaying its history after a
+// `--bg --resume` and is not yet ready to accept input. A large session can sit
+// in this state for several seconds; attaching during this window races with the
+// worker finishing its boot.
+func (s Session) Resuming() bool {
+	return s.State == "resuming"
+}
+
+// Crashed reports whether the worker is flagged crashed. This can show up
+// transiently while a resumed worker replays/runs its first turn and then
+// recovers, so it is treated as a not-yet-usable state to wait through, not as a
+// terminal failure (only leaving the roster — being retired — is terminal).
+func (s Session) Crashed() bool {
+	return s.State == "crashed"
+}
+
+// Usable reports whether the session is in a normal, attachable state — booted
+// and not in a transient startup state (resuming/crashed). A resume is only
+// trustworthy once the worker reaches and holds a usable state.
+func (s Session) Usable() bool {
+	return !s.Resuming() && !s.Crashed() && s.State != ""
+}

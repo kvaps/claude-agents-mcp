@@ -110,6 +110,31 @@ func Create(cwd, name string, dangerous bool) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// Resume brings a not-running session back as a background worker (runs
+// `claude --bg --resume <sessionID>`) and returns the command output, which
+// carries the freshly-allocated short id. Resuming a session that is already
+// live spawns a second worker the daemon then retires (it keeps one worker per
+// session), so the returned short can be dead on arrival — callers must verify
+// liveness first (resume_session checks the roster and waits via WaitLive).
+func Resume(sessionID string, dangerous bool) (string, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return "", fmt.Errorf("session id is required")
+	}
+	bin, err := claudePath()
+	if err != nil {
+		return "", err
+	}
+	args := []string{"--bg", "--resume", sessionID}
+	if dangerous {
+		args = append(args, "--dangerously-skip-permissions")
+	}
+	out, err := exec.Command(bin, args...).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("claude --bg --resume failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // Stop gracefully stops a session (it stays in the list, idle).
 func Stop(short string) error { return runClaude("stop", short) }
 
