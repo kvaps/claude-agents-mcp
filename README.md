@@ -34,6 +34,7 @@ Session management:
 - `get_session` — one session by short id / session id / name
 - `create_session` — `claude --bg` in a directory (optional name, dangerous mode); with `prompt` it delivers and reliably submits the task so the agent starts immediately (`goal=true` sends it as `/goal`)
 - `submit_prompt` — deliver a prompt to a session and reliably submit it in one call (handles long/multi-line bracketed-paste, verifies the turn started, retries Enter once); `goal=true` sends `/goal`
+- `resume_session` — `claude --bg --resume` a not-running session and **return only once the worker is verified live**, so you never attach to a job that "already exited". Refuses to resume an already-live session (a duplicate resume spawns a second worker the daemon retires), starts each attempt from a clean slate, and retries an intermittent retirement. Accepts a name, short id, or full session id; optional `prompt` is delivered once it settles (`goal=true` sends `/goal`)
 - `rename_session` — set a session's custom title (`ctrl+r` in the agents view)
 - `pin_session` — pin / unpin a session so it sorts to the top (`ctrl+t` in the agents view)
 - `reorder_session` — move a running session up/down or to an absolute slot (`shift+↑/↓` in the agents view)
@@ -55,6 +56,7 @@ Attach — everything a human can do inside a session:
 - [x] Get a single session
 - [x] Create a session (`claude --bg`), optionally delivering + submitting a starting prompt (or `/goal`)
 - [x] Reliably deliver + submit a prompt (`submit_prompt`): bracketed-paste for long/multi-line, verify the turn started
+- [x] Resume a not-running session (`resume_session`): clean-slate `claude --bg --resume`, dedup against a live worker, verify liveness before returning, retry an intermittent retirement
 - [x] Rename a session (`ctrl+r`; custom title via `.meta.json` sidecar)
 - [x] Pin / unpin a session (`ctrl+t`; agents-view pin set in `~/.claude/jobs/pins.json`)
 - [x] Reorder a session up/down or to an absolute slot (`shift+↑/↓`; sort keys in `~/.claude/jobs/<id>/order`)
@@ -81,7 +83,8 @@ Attach — everything a human can do inside a session:
 
 - `list` uses the daemon control op `list` for rich state, enriched with `claude agents --json` for the display name and worktree `cwd` (which `op:list` omits).
 - attach actions open the daemon's `op:attach` raw PTY stream and write keystrokes — the exact same channel as the human keyboard. Reads come back from the same stream (or `op:subscribe` for `read_screen`).
-- create / stop / remove shell out to the stable public `claude` CLI.
+- create / resume / stop / remove shell out to the stable public `claude` CLI.
+- resume is fragile at the CLI level: `claude --bg --resume` returns a new short id immediately, but the worker then boots — it can sit in `resuming` (replaying history), flicker through `crashed` on its first turn, or be retired by the daemon entirely (the cause of a resume that has "already exited" by the time you attach). Resuming a session that is **already live** spawns a second worker the daemon then retires, so the new short can be dead on arrival. `resume_session` works around all of this: it refuses to duplicate a live session, clears any leftover worker first (so each attempt starts clean), then polls the roster until the worker holds a usable state through a short settle window — only then does it return, retrying once on a genuine retirement.
 - pin / reorder are **not** daemon ops — the agents-view picker keeps them on disk under `~/.claude/jobs`: the pin set in `pins.json` (a JSON array of short ids, written under a lock) and per-session sort keys in `<id>/order` and `<id>/stateOrder`. `pin_session` / `reorder_session` write exactly those files, so the change is durable and any picker reflects it.
 
 Slash commands only work over the raw PTY (`op:attach`): they are REPL input, not conversation messages, so they cannot be delivered through any message/dispatch channel.
