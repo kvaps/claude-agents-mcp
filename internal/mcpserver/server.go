@@ -79,6 +79,69 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		return mcp.NewToolResultText(fmt.Sprintf("created %s and started the task", short)), nil
 	})
 
+	s.AddTool(mcp.NewTool("resume_session",
+		mcp.WithDescription("Bring a not-running session back as a background worker (runs `claude --bg --resume`) and only return once the worker is verified live — never a job that 'already exited'. `claude --bg --resume` is intermittent: a resumed worker sometimes runs a phantom turn and is retired by the daemon within seconds, which is why a raw resume periodically dies right after coming up. This tool detects that retirement and retries the resume (a fresh attempt usually wins the race), and it refuses to resume a session that is already live (a duplicate resume spawns a second worker the daemon then retires). Accepts a name, short id, or full session id (the latter works even for sessions no longer in the agents list). With prompt set, the task is delivered and submitted once the resumed session settles at its prompt (best-effort; goal=true sends it as /goal)."),
+		mcp.WithString("session", mcp.Required(), mcp.Description("session id, short id, or name to resume")),
+		mcp.WithString("prompt", mcp.Description("task to deliver and submit once the session is ready (best-effort; optional)")),
+		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
+		mcp.WithBoolean("dangerous", mcp.Description("pass --dangerously-skip-permissions")),
+	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		ref := r.GetString("session", "")
+		sessionID := ref
+		if sess, rerr := a.Resolve(ref); rerr == nil {
+			if sess.Live {
+				return mcp.NewToolResultText(fmt.Sprintf("session %s is already live (state=%s); not resuming to avoid a duplicate worker the daemon would retire — use submit_prompt to (re)seed it", sess.Short, sess.State)), nil
+			}
+			sessionID = sess.SessionID
+		} else if !agents.IsFullSessionID(ref) {
+			return mcp.NewToolResultError(rerr.Error()), nil
+		}
+
+		// A clean single resume is reliable; the failures come from colliding with
+		// a leftover worker or attaching before the worker stabilises. Each attempt
+		// therefore starts from a clean slate (EnsureNotLive) and only returns once
+		// WaitLive confirms the worker held a usable state. On a genuine retirement
+		// we retry once after a calm delay (rapid resume/stop cycling destabilises
+		// the daemon, so the retry is deliberately unhurried).
+		const maxAttempts = 3
+		var cur agents.Session
+		var short string
+		var lastErr error
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			if attempt > 1 {
+				time.Sleep(2 * time.Second)
+			}
+			a.EnsureNotLive(sessionID, 6*time.Second)
+			out, err := agents.Resume(sessionID, r.GetBool("dangerous", false))
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil // launch failure is not a race; don't retry
+			}
+			short = agents.ParseShortID(out)
+			if short == "" {
+				return mcp.NewToolResultError("resumed but could not parse the new short id from output:\n" + out), nil
+			}
+			cur, lastErr = a.WaitLive(short, 45*time.Second, 5*time.Second)
+			if lastErr == nil {
+				break
+			}
+		}
+		if lastErr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("resume failed: %v. The session is intact on disk — drive it from the agents view or start a fresh session", lastErr)), nil
+		}
+
+		prompt := r.GetString("prompt", "")
+		if strings.TrimSpace(prompt) == "" {
+			return mcp.NewToolResultText(fmt.Sprintf("resumed %s (live, state=%s)", short, cur.State)), nil
+		}
+		if err := a.WaitReady(short, 20*time.Second); err != nil {
+			return mcp.NewToolResultText(fmt.Sprintf("resumed %s (live, state=%s) but it never settled at a prompt; task NOT delivered — read_screen and drive it manually", short, cur.State)), nil
+		}
+		if _, err := a.SubmitPrompt(short, prompt, r.GetBool("goal", false)); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("resumed %s but %v", short, err)), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("resumed %s and started the task", short)), nil
+	})
+
 	s.AddTool(mcp.NewTool("submit_prompt",
 		mcp.WithDescription("Deliver a prompt to a session and reliably submit it in one call (handles bracketed-paste for long/multi-line text, then verifies the turn actually started, retrying Enter once). Use this to (re)seed a session's task instead of send_text+send_keys. goal=true sends it as /goal."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
