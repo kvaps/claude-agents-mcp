@@ -130,6 +130,39 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		return mcp.NewToolResultText(fmt.Sprintf("resumed %s and started the task", short)), nil
 	})
 
+	s.AddTool(mcp.NewTool("fork_session",
+		mcp.WithDescription("Fork a session into a new, independent background session that carries ALL of the source's history up to the moment of the fork. The fork shows up in `claude agents` as its own entry (new short id, new session id) and can be driven immediately; the source session is never touched. Uses Claude Code's native --fork-session, so the full transcript is forked correctly (not a shallow copy). The fork inherits the source's working directory. Accepts a name, short id, or full session id for the source. With prompt set, the task is delivered and submitted once the fork settles at its prompt (best-effort; goal=true sends it as /goal)."),
+		mcp.WithString("session", mcp.Required(), mcp.Description("source session to fork: short id, session id, or name")),
+		mcp.WithString("name", mcp.Description("display name for the new forked session")),
+		mcp.WithString("prompt", mcp.Description("task to deliver and submit once the fork is ready (best-effort; optional)")),
+		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
+		mcp.WithBoolean("dangerous", mcp.Description("pass --dangerously-skip-permissions")),
+	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		sess, err := a.Resolve(r.GetString("session", ""))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if sess.SessionID == "" {
+			return mcp.NewToolResultError("source session has no session id on disk; cannot fork"), nil
+		}
+		out, err := a.ForkSession(sess.SessionID, sess.Cwd, r.GetString("name", ""), r.GetBool("dangerous", false))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("fork failed: %v. The source session %s is intact", err, sess.Short)), nil
+		}
+		short := out.Short
+		prompt := r.GetString("prompt", "")
+		if strings.TrimSpace(prompt) == "" {
+			return mcp.NewToolResultText(fmt.Sprintf("forked %s -> %s (live, state=%s, session id %s); carries the source's full history", sess.Short, short, out.State, out.SessionID)), nil
+		}
+		if err := a.WaitReady(short, 20*time.Second); err != nil {
+			return mcp.NewToolResultText(fmt.Sprintf("forked %s -> %s (live, state=%s) but it never settled at a prompt; task NOT delivered — read_screen and drive it manually", sess.Short, short, out.State)), nil
+		}
+		if _, err := a.SubmitPrompt(short, prompt, r.GetBool("goal", false)); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("forked %s -> %s but %v", sess.Short, short, err)), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("forked %s -> %s and started the task", sess.Short, short)), nil
+	})
+
 	s.AddTool(mcp.NewTool("submit_prompt",
 		mcp.WithDescription("Deliver a prompt to a session and reliably submit it in one call (handles bracketed-paste for long/multi-line text, then verifies the turn actually started, retrying Enter once). Use this to (re)seed a session's task instead of send_text+send_keys. goal=true sends it as /goal."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
