@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -226,6 +227,76 @@ func touchState(short string) {
 	p := filepath.Join(dir, short, "state.json")
 	now := time.Now()
 	_ = os.Chtimes(p, now, now)
+}
+
+// RenameJobState sets a session's custom display name in its daemon job state
+// (~/.claude/jobs/<short>/state.json) — the authoritative store the agents view
+// (`claude agents`) reads. The daemon resolves the displayed name from the
+// state's `name` field (falling back to the short id when it is empty); the
+// projects-side `customTitle` sidecar feeds a different name system (the `claude`
+// resume picker), so writing only that lets the auto-derived job name win and the
+// rename appears to revert.
+//
+// It writes `name` plus `nameSource:"user"` so the daemon's auto-namer leaves it
+// alone — the daemon only auto-derives a name for a session whose state has none
+// yet — and rewrites any `--name` token in respawnFlags so a daemon
+// restart/respawn re-applies the new name instead of the original one.
+//
+// It returns (false, nil) when the session has no on-disk job state (e.g. a
+// not-running session with no jobs/<short> dir), so callers can fall back to the
+// projects sidecar for those.
+func RenameJobState(short, title string) (bool, error) {
+	if short == "" || title == "" {
+		return false, nil
+	}
+	dir, err := jobsDir()
+	if err != nil {
+		return false, err
+	}
+	path := filepath.Join(dir, short, "state.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	// Decode into a generic map so every field the daemon owns is preserved on
+	// write; we only touch name, nameSource, respawnFlags and updatedAt.
+	var state map[string]any
+	if err := json.Unmarshal(b, &state); err != nil {
+		return false, fmt.Errorf("parse %s: %w", path, err)
+	}
+	state["name"] = title
+	state["nameSource"] = "user"
+	state["updatedAt"] = time.Now().UTC().Format(time.RFC3339)
+	if flags, ok := state["respawnFlags"].([]any); ok {
+		renameRespawnFlag(flags, title)
+	}
+	if err := writeJSONAtomic(path, state); err != nil {
+		return false, err
+	}
+	touchState(short)
+	return true, nil
+}
+
+// renameRespawnFlag replaces the value of a "--name" token in a respawnFlags
+// slice in place (both the "--name", "value" and "--name=value" forms), so a
+// daemon respawn re-applies the new title instead of the original --name the
+// session was launched with. It does nothing when no --name token is present —
+// in that case the name persists from the state's `name` field alone.
+func renameRespawnFlag(flags []any, title string) {
+	for i, v := range flags {
+		s, _ := v.(string)
+		switch {
+		case s == "--name" && i+1 < len(flags):
+			flags[i+1] = title
+			return
+		case strings.HasPrefix(s, "--name="):
+			flags[i] = "--name=" + title
+			return
+		}
+	}
 }
 
 // effRow is a daemon session with its effective flat sort key.

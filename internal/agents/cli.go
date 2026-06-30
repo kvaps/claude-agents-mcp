@@ -158,11 +158,38 @@ func runClaude(sub, short string) error {
 }
 
 // Rename sets the custom title of a session — the same effect as renaming a
-// session in the agents view. It writes customTitle into the session's
-// .meta.json sidecar under ~/.claude/projects/<encoded-cwd>/.
-func Rename(sessionID, cwd, title string) error {
-	if sessionID == "" || title == "" {
-		return fmt.Errorf("session id and title are required")
+// session in the agents view. The authoritative store for the agents view
+// (`claude agents`) is the daemon job state (~/.claude/jobs/<short>/state.json):
+// it reads the displayed name from the state's `name` field, so the rename is
+// written there first (see RenameJobState). The projects-side customTitle sidecar
+// is a different name system (it feeds the `claude` resume picker); it is written
+// as a best-effort secondary so the same name shows there too and so not-running
+// sessions without a job dir still get renamed.
+func Rename(short, sessionID, cwd, title string) error {
+	if title == "" {
+		return fmt.Errorf("title is required")
+	}
+	wroteState, stateErr := RenameJobState(short, title)
+	if stateErr != nil {
+		return stateErr
+	}
+	metaErr := writeCustomTitle(sessionID, cwd, title)
+	if metaErr != nil && !wroteState {
+		return metaErr // neither store could be written
+	}
+	if !wroteState && metaErr == nil && sessionID == "" {
+		return fmt.Errorf("no job state for %q and no session id to record a custom title", short)
+	}
+	return nil
+}
+
+// writeCustomTitle records customTitle in the session's .meta.json sidecar under
+// ~/.claude/projects/<encoded-cwd>/, the name source the `claude` resume picker
+// reads. It is a no-op when the session id or cwd is unknown (the sidecar cannot
+// be located without them).
+func writeCustomTitle(sessionID, cwd, title string) error {
+	if sessionID == "" || cwd == "" {
+		return nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
