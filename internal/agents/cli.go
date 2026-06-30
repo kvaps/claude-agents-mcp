@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // bgShortRe extracts the new session's short id from `claude --bg` output,
@@ -156,22 +157,31 @@ func runClaude(sub, short string) error {
 	return nil
 }
 
-// Rename sets a session's display name natively, in both name systems the
-// `claude` CLI uses:
+// Rename sets a session's display name as natively as possible.
 //
-//   - The agents view (`claude agents`) reads the daemon job state
-//     (~/.claude/jobs/<short>/state.json) `name` field — written by RenameJobState.
-//   - The resume picker / `claude` session list read the session transcript: the
-//     CLI's /rename appends `custom-title` and `agent-name` events to the
-//     <sessionID>.jsonl, and readers scan those out of its head/tail — written by
-//     writeSessionTitle.
+// Preferred path (live session): have the session run its own /rename command
+// via the daemon's op:reply. The CLI then updates the job state and the
+// transcript AND syncs the title to the claude.ai bridge (claude remote) — the
+// bridge sync needs the session's own OAuth context, which only its process has,
+// so this is the only way to keep the remote view in step.
 //
-// Both are best-effort and independent: a live session updates the job state
-// (and its transcript if present), a not-running session with only a transcript
-// still gets renamed there. It errors only when neither store could be touched.
-func Rename(short, sessionID, cwd, title string) error {
+// Fallback (not-running session, or the command didn't take): write the stores
+// directly — the job state (~/.claude/jobs/<short>/state.json `name`, read by
+// `claude agents`; see RenameJobState) and the transcript `custom-title` /
+// `agent-name` events (read by the resume picker; see writeSessionTitle). No
+// bridge sync is possible without a running worker.
+func (c *Client) Rename(short, sessionID, cwd, title string) error {
+	title = strings.TrimSpace(title)
 	if title == "" {
 		return fmt.Errorf("title is required")
+	}
+	if strings.ContainsAny(title, "\r\n") {
+		return fmt.Errorf("title must be a single line")
+	}
+	if short != "" {
+		if err := c.Reply(short, "/rename "+title); err == nil && c.waitJobName(short, title, 4*time.Second) {
+			return nil // the session renamed itself: job state, transcript and bridge
+		}
 	}
 	wroteState, stateErr := RenameJobState(short, title)
 	if stateErr != nil {
@@ -185,6 +195,22 @@ func Rename(short, sessionID, cwd, title string) error {
 		return fmt.Errorf("could not rename %q: no daemon job state and no transcript at its cwd", short)
 	}
 	return nil
+}
+
+// waitJobName polls a session's on-disk job state until its name equals want, so
+// a rename driven through the session's own /rename command can be confirmed
+// before reporting success. Returns false on timeout.
+func (c *Client) waitJobName(short, want string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if js, err := ReadJobState(short); err == nil && js.Name == want {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
 }
 
 // writeSessionTitle records the rename in the session transcript the way the

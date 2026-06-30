@@ -156,7 +156,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		title := r.GetString("title", "")
-		if err := agents.Rename(sess.Short, sess.SessionID, sess.Cwd, title); err != nil {
+		if err := a.Rename(sess.Short, sess.SessionID, sess.Cwd, title); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		return mcp.NewToolResultText(fmt.Sprintf("renamed %s -> %q", sess.Short, title)), nil

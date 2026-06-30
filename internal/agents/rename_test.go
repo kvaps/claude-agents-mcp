@@ -230,7 +230,7 @@ func TestRenameLiveIntegration(t *testing.T) {
 	}
 	newTitle := "rename-it-" + randID()[:6]
 
-	if err := Rename(sess.Short, sess.SessionID, sess.Cwd, newTitle); err != nil {
+	if err := c.Rename(sess.Short, sess.SessionID, sess.Cwd, newTitle); err != nil {
 		t.Fatalf("Rename: %v", err)
 	}
 
