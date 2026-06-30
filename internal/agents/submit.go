@@ -55,10 +55,33 @@ func (c *Client) waitStarted(short string, base Session, timeout time.Duration) 
 	}
 }
 
-// SubmitPrompt delivers text to a session's prompt and reliably submits it,
-// then verifies the turn actually started. It is the single delivery path for
-// both plain prompts and /goal commands (goal just prefixes "/goal "), so both
-// get the same guarantees.
+// SubmitPrompt delivers text to a session and submits it as a turn. It is the
+// single delivery path for both plain prompts and /goal commands (goal just
+// prefixes "/goal ").
+//
+// Preferred path: the daemon's native op:reply (see Reply), which hands the text
+// straight to the worker's REPL — no PTY typing, bracketed paste, or Enter race.
+// A successful ack means the turn was submitted, so it returns right away;
+// callers wait for the session to be ready before submitting, so the ack is
+// trustworthy. Only when the native op is unavailable (an older daemon, a peer
+// backend, or a session not accepting replies) does it fall back to the
+// keystroke-emulation path, submitViaPTY.
+func (c *Client) SubmitPrompt(short, text string, goal bool) (string, error) {
+	body := strings.TrimRight(text, "\r\n")
+	if goal {
+		body = "/goal " + strings.TrimSpace(text)
+	}
+	if strings.TrimSpace(body) == "" {
+		return "", fmt.Errorf("empty prompt")
+	}
+	if err := c.Reply(short, body); err == nil {
+		return "", nil
+	}
+	return c.submitViaPTY(short, body)
+}
+
+// submitViaPTY is the keystroke-emulation fallback for SubmitPrompt: it types the
+// prompt into the session's PTY and verifies the turn started.
 //
 // The body is delivered as a bracketed paste so multi-line input is treated as
 // one literal block (newlines don't submit early). The paste is sent in wait
@@ -74,15 +97,7 @@ func (c *Client) waitStarted(short string, base Session, timeout time.Duration) 
 // via the daemon roster (op:list) and Enter is retried once before reporting
 // failure, so a session is never left silently idle holding an unsubmitted
 // prompt.
-func (c *Client) SubmitPrompt(short, text string, goal bool) (string, error) {
-	body := strings.TrimRight(text, "\r\n")
-	if goal {
-		body = "/goal " + strings.TrimSpace(text)
-	}
-	if strings.TrimSpace(body) == "" {
-		return "", fmt.Errorf("empty prompt")
-	}
-
+func (c *Client) submitViaPTY(short, body string) (string, error) {
 	// Deliver as a bracketed paste (the session enables paste mode), so the
 	// whole multi-line body lands in the input box without submitting per line.
 	// wait=true drains the paste's redraw so we only proceed once it has fully
