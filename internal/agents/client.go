@@ -274,32 +274,6 @@ func (c *Client) WaitLive(short string, timeout, settle time.Duration) (Session,
 	}
 }
 
-// EnsureNotLive stops any live workers for a session id and waits until none
-// remain in the daemon roster, so a (re)resume starts from a clean slate and
-// cannot collide with a leftover worker — which is what makes the daemon retire
-// one of the pair. Best-effort: it returns once the roster is clear of this
-// session or the timeout elapses.
-func (c *Client) EnsureNotLive(sessionID string, timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	for {
-		live, err := c.listDaemon()
-		if err != nil {
-			return
-		}
-		any := false
-		for _, j := range live {
-			if j.SessionID == sessionID {
-				_ = Stop(j.Short)
-				any = true
-			}
-		}
-		if !any || time.Now().After(deadline) {
-			return
-		}
-		time.Sleep(300 * time.Millisecond)
-	}
-}
-
 // WaitIdle polls until the session is no longer actively working, or timeout.
 func (c *Client) WaitIdle(short string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
