@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 )
 
 // bgShortRe extracts the new session's short id from `claude --bg` output,
@@ -157,14 +156,19 @@ func runClaude(sub, short string) error {
 	return nil
 }
 
-// Rename sets the custom title of a session — the same effect as renaming a
-// session in the agents view. The authoritative store for the agents view
-// (`claude agents`) is the daemon job state (~/.claude/jobs/<short>/state.json):
-// it reads the displayed name from the state's `name` field, so the rename is
-// written there first (see RenameJobState). The projects-side customTitle sidecar
-// is a different name system (it feeds the `claude` resume picker); it is written
-// as a best-effort secondary so the same name shows there too and so not-running
-// sessions without a job dir still get renamed.
+// Rename sets a session's display name natively, in both name systems the
+// `claude` CLI uses:
+//
+//   - The agents view (`claude agents`) reads the daemon job state
+//     (~/.claude/jobs/<short>/state.json) `name` field — written by RenameJobState.
+//   - The resume picker / `claude` session list read the session transcript: the
+//     CLI's /rename appends `custom-title` and `agent-name` events to the
+//     <sessionID>.jsonl, and readers scan those out of its head/tail — written by
+//     writeSessionTitle.
+//
+// Both are best-effort and independent: a live session updates the job state
+// (and its transcript if present), a not-running session with only a transcript
+// still gets renamed there. It errors only when neither store could be touched.
 func Rename(short, sessionID, cwd, title string) error {
 	if title == "" {
 		return fmt.Errorf("title is required")
@@ -173,48 +177,69 @@ func Rename(short, sessionID, cwd, title string) error {
 	if stateErr != nil {
 		return stateErr
 	}
-	metaErr := writeCustomTitle(sessionID, cwd, title)
-	if metaErr != nil && !wroteState {
-		return metaErr // neither store could be written
+	wroteTitle, titleErr := writeSessionTitle(sessionID, cwd, title)
+	if titleErr != nil && !wroteState {
+		return titleErr // job state untouched and the transcript write failed
 	}
-	if !wroteState && metaErr == nil && sessionID == "" {
-		return fmt.Errorf("no job state for %q and no session id to record a custom title", short)
+	if !wroteState && !wroteTitle {
+		return fmt.Errorf("could not rename %q: no daemon job state and no transcript at its cwd", short)
 	}
 	return nil
 }
 
-// writeCustomTitle records customTitle in the session's .meta.json sidecar under
-// ~/.claude/projects/<encoded-cwd>/, the name source the `claude` resume picker
-// reads. It is a no-op when the session id or cwd is unknown (the sidecar cannot
-// be located without them).
-func writeCustomTitle(sessionID, cwd, title string) error {
+// writeSessionTitle records the rename in the session transcript the way the
+// CLI's /rename does: it appends a `custom-title` event (the title the resume
+// picker and `claude` session list read) and an `agent-name` event (the
+// prompt-bar display name) to ~/.claude/projects/<sanitized-cwd>/<sessionID>.jsonl.
+// Readers scan these out of the transcript head/tail; the CLI never reads the
+// .meta.json sidecar our earlier code wrote, so that write was inert.
+//
+// It is best-effort: it appends only to an already-existing transcript (so it
+// never creates an orphan metadata-only file at a guessed path) and is a no-op
+// when the session id or cwd is unknown. Returns whether it appended.
+func writeSessionTitle(sessionID, cwd, title string) (bool, error) {
 	if sessionID == "" || cwd == "" {
-		return nil
+		return false, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return err
+		return false, err
 	}
-	dir := filepath.Join(home, ".claude", "projects", encodeCwd(cwd))
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+	path := filepath.Join(home, ".claude", "projects", sanitizeProjectPath(cwd), sessionID+".jsonl")
+	if _, err := os.Stat(path); err != nil {
+		return false, nil // no transcript at the guessed path; the job-state name still applies
 	}
-	path := filepath.Join(dir, sessionID+".meta.json")
-	meta := map[string]any{}
-	if b, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(b, &meta)
-	}
-	meta["customTitle"] = title
-	meta["updatedAt"] = time.Now().UTC().Format(time.RFC3339)
-	b, err := json.MarshalIndent(meta, "", "  ")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return false, err
 	}
-	return os.WriteFile(path, b, 0o644)
+	defer func() { _ = f.Close() }()
+	for _, entry := range []map[string]any{
+		{"type": "custom-title", "customTitle": title, "sessionId": sessionID},
+		{"type": "agent-name", "agentName": title, "sessionId": sessionID},
+	} {
+		b, err := json.Marshal(entry)
+		if err != nil {
+			return false, err
+		}
+		if _, err := f.Write(append(b, '\n')); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
-// encodeCwd maps a working directory to the project directory name Claude Code
-// uses under ~/.claude/projects (slashes and dots become dashes).
-func encodeCwd(cwd string) string {
-	return strings.NewReplacer("/", "-", ".", "-").Replace(cwd)
+// nonAlnum matches every character the CLI's sanitizePath rewrites.
+var nonAlnum = regexp.MustCompile(`[^a-zA-Z0-9]`)
+
+// sanitizeProjectPath maps a working directory to the project directory name
+// Claude Code uses under ~/.claude/projects, matching the CLI's sanitizePath:
+// every non-alphanumeric character becomes a dash. The earlier encoder replaced
+// only "/" and ".", so a cwd containing "_", a space, etc. resolved to a phantom
+// directory the CLI never reads.
+//
+// The CLI appends a hash suffix when the sanitized name exceeds 200 chars (very
+// deep paths); that rare edge case is not reproduced here.
+func sanitizeProjectPath(cwd string) string {
+	return nonAlnum.ReplaceAllString(cwd, "-")
 }
