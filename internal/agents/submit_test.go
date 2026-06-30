@@ -57,8 +57,16 @@ func TestSubmitPromptStartsTurnIntegration(t *testing.T) {
 	for _, tc := range cases {
 		for i := 0; i < itersPerCase; i++ {
 			settleIdle(t, c, short)
+			base, _ := c.Resolve(short)
 			if _, err := c.SubmitPrompt(short, longMultilinePrompt, tc.goal); err != nil {
-				t.Errorf("%s iter %d: turn did not start (manual Enter would be needed): %v", tc.name, i, err)
+				t.Errorf("%s iter %d: SubmitPrompt failed: %v", tc.name, i, err)
+				continue
+			}
+			// Verify the turn actually started, independent of which path
+			// SubmitPrompt took (native op:reply or the PTY fallback), so the
+			// guarantee holds either way.
+			if !c.waitStarted(short, base, 8*time.Second) {
+				t.Errorf("%s iter %d: SubmitPrompt returned ok but no turn started", tc.name, i)
 				continue
 			}
 			t.Logf("%s iter %d: turn started", tc.name, i)
