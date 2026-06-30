@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -124,6 +125,74 @@ func TestRenameJobStateMissingIsNoOp(t *testing.T) {
 	}
 	if wrote {
 		t.Error("expected wrote=false for a session with no job dir")
+	}
+}
+
+func TestSanitizeProjectPath(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"/Users/kvaps/git/cozystack", "-Users-kvaps-git-cozystack"},
+		{"/Users/kvaps/git/freedom_cloud_docs", "-Users-kvaps-git-freedom-cloud-docs"},
+		{"/tmp/a.b/c d", "-tmp-a-b-c-d"},
+		{"plugin:name:server", "plugin-name-server"},
+	}
+	for _, c := range cases {
+		if got := sanitizeProjectPath(c.in); got != c.want {
+			t.Errorf("sanitizeProjectPath(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestWriteSessionTitle appends title events to a fixture transcript and asserts
+// the canonical custom-title / agent-name JSONL lines are written, and that a
+// missing transcript is a no-op (no orphan file created).
+func TestWriteSessionTitle(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sid := "11111111-2222-3333-4444-555555555555"
+	cwd := "/Users/x/proj_one"
+	projDir := filepath.Join(home, ".claude", "projects", sanitizeProjectPath(cwd))
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(projDir, sid+".jsonl")
+
+	// Missing transcript: no-op, no file created.
+	wrote, err := writeSessionTitle(sid, cwd, "x")
+	if err != nil || wrote {
+		t.Fatalf("missing transcript: got wrote=%v err=%v, want false,nil", wrote, err)
+	}
+	if _, statErr := os.Stat(transcript); statErr == nil {
+		t.Fatal("writeSessionTitle created an orphan transcript for a missing file")
+	}
+
+	// Existing transcript: appends both events, preserving prior content.
+	if err := os.WriteFile(transcript, []byte("{\"type\":\"user\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wrote, err = writeSessionTitle(sid, cwd, "▶ my title")
+	if err != nil || !wrote {
+		t.Fatalf("existing transcript: got wrote=%v err=%v, want true,nil", wrote, err)
+	}
+	b, err := os.ReadFile(transcript)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 lines (1 original + 2 events), got %d: %q", len(lines), string(b))
+	}
+	var ct, an map[string]any
+	if err := json.Unmarshal([]byte(lines[1]), &ct); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(lines[2]), &an); err != nil {
+		t.Fatal(err)
+	}
+	if ct["type"] != "custom-title" || ct["customTitle"] != "▶ my title" || ct["sessionId"] != sid {
+		t.Errorf("custom-title line wrong: %v", ct)
+	}
+	if an["type"] != "agent-name" || an["agentName"] != "▶ my title" || an["sessionId"] != sid {
+		t.Errorf("agent-name line wrong: %v", an)
 	}
 }
 
