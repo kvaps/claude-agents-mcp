@@ -1,10 +1,16 @@
 package agents
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
+
+// errNotStarted is returned when a prompt was delivered but no turn started: the
+// text is sitting unsubmitted in the input box (typically collapsed to a
+// "[Pasted text]" bracketed paste that still needs an Enter).
+var errNotStarted = errors.New("prompt delivered but the session did not start a turn — the text is in the input box; retry submit_prompt or send Enter")
 
 // readyMarkers are strings that appear once a freshly-booted session has
 // rendered its REPL prompt and can accept input.
@@ -55,17 +61,22 @@ func (c *Client) waitStarted(short string, base Session, timeout time.Duration) 
 	}
 }
 
-// SubmitPrompt delivers text to a session and submits it as a turn. It is the
-// single delivery path for both plain prompts and /goal commands (goal just
-// prefixes "/goal ").
+// SubmitPrompt delivers text to a session and submits it as a turn, then always
+// verifies the turn actually started before reporting success. It is the single
+// delivery path for both plain prompts and /goal commands (goal just prefixes
+// "/goal "), so both get the same guarantee.
 //
-// Preferred path: the daemon's native op:reply (see Reply), which hands the text
-// straight to the worker's REPL — no PTY typing, bracketed paste, or Enter race.
-// A successful ack means the turn was submitted, so it returns right away;
-// callers wait for the session to be ready before submitting, so the ack is
-// trustworthy. Only when the native op is unavailable (an older daemon, a peer
-// backend, or a session not accepting replies) does it fall back to the
-// keystroke-emulation path, submitViaPTY.
+// Preferred delivery: the daemon's native op:reply (see Reply), which hands the
+// text straight to the worker's REPL — no PTY typing. But a successful op:reply
+// ack only means the text reached the REPL, NOT that a turn started: for a long
+// or multi-line body the REPL collapses it into an unsubmitted bracketed paste
+// ("[Pasted text]") that still needs an Enter, so the ack alone is not
+// trustworthy. So after a successful ack we still verify the turn started via the
+// daemon roster (op:list); if it hasn't, we press Enter to rescue the
+// unsubmitted paste, retrying once before reporting failure. When the native op
+// is unavailable (an older daemon, a peer backend, or a session not accepting
+// replies) it falls back to the keystroke-emulation path, submitViaPTY, which
+// carries the same verify+retry guarantee.
 func (c *Client) SubmitPrompt(short, text string, goal bool) (string, error) {
 	body := strings.TrimRight(text, "\r\n")
 	if goal {
@@ -74,10 +85,48 @@ func (c *Client) SubmitPrompt(short, text string, goal bool) (string, error) {
 	if strings.TrimSpace(body) == "" {
 		return "", fmt.Errorf("empty prompt")
 	}
-	if err := c.Reply(short, body); err == nil {
+
+	// Snapshot the baseline BEFORE delivery so a started turn is detectable as a
+	// change afterwards. The native op:reply can itself submit the turn, so the
+	// baseline must predate it — capturing after would already reflect the started
+	// state and hide the change.
+	base, _ := c.Resolve(short)
+
+	// On a native-op error, fall back to the PTY paste path (self-contained: it
+	// pastes, settles, and verifies with its own baseline).
+	if err := c.Reply(short, body); err != nil {
+		return c.submitViaPTY(short, body)
+	}
+
+	// Native op acked. Don't trust it: verify the turn started, and if it hasn't
+	// (the body is sitting as an unsubmitted paste), press Enter to submit it,
+	// retrying once before reporting failure.
+	if c.waitStarted(short, base, 4*time.Second) {
 		return "", nil
 	}
-	return c.submitViaPTY(short, body)
+	screen, ok := c.submitEnterUntilStarted(short, base)
+	if ok {
+		return screen, nil
+	}
+	return screen, errNotStarted
+}
+
+// submitEnterUntilStarted presses Enter to submit a prompt still sitting in the
+// input box and verifies the turn started, retrying once. It is shared by the
+// native-reply rescue and the PTY paste path so both converge on the same
+// verify+retry-Enter guarantee. Pressing Enter is safe even if a turn is already
+// running (the input box is empty, so the keystroke is a no-op) — the leading
+// waitStarted in SubmitPrompt avoids that case anyway. Returns the last screen
+// and whether the turn started.
+func (c *Client) submitEnterUntilStarted(short string, base Session) (string, bool) {
+	var screen string
+	for attempt := 0; attempt < 2; attempt++ {
+		screen, _ = c.send(short, []byte("\r"), true, 800*time.Millisecond)
+		if c.waitStarted(short, base, 6*time.Second) {
+			return screen, true
+		}
+	}
+	return screen, false
 }
 
 // submitViaPTY is the keystroke-emulation fallback for SubmitPrompt: it types the
@@ -93,10 +142,10 @@ func (c *Client) SubmitPrompt(short, text string, goal bool) (string, error) {
 // so the submit Enter raced the not-yet-settled input and the text was left
 // sitting unsubmitted in the box — most visible on long /goal pastes, where the
 // leading slash also spins up the command menu and adds render latency. After
-// the paste has settled a distinct Enter submits it; the turn is then verified
-// via the daemon roster (op:list) and Enter is retried once before reporting
-// failure, so a session is never left silently idle holding an unsubmitted
-// prompt.
+// the paste has settled a distinct Enter submits it (via submitEnterUntilStarted,
+// shared with the native path); the turn is verified via the daemon roster
+// (op:list) and Enter is retried once before reporting failure, so a session is
+// never left silently idle holding an unsubmitted prompt.
 func (c *Client) submitViaPTY(short, body string) (string, error) {
 	// Deliver as a bracketed paste (the session enables paste mode), so the
 	// whole multi-line body lands in the input box without submitting per line.
@@ -113,13 +162,9 @@ func (c *Client) submitViaPTY(short, body string) (string, error) {
 	time.Sleep(300 * time.Millisecond)
 	base, _ := c.Resolve(short)
 
-	// Submit with a distinct Enter, then verify the turn started; retry once.
-	var screen string
-	for attempt := 0; attempt < 2; attempt++ {
-		screen, _ = c.send(short, []byte("\r"), true, 800*time.Millisecond)
-		if c.waitStarted(short, base, 6*time.Second) {
-			return screen, nil
-		}
+	screen, ok := c.submitEnterUntilStarted(short, base)
+	if ok {
+		return screen, nil
 	}
-	return screen, fmt.Errorf("prompt delivered but the session did not start a turn — the text is in the input box; retry submit_prompt or send Enter")
+	return screen, errNotStarted
 }
