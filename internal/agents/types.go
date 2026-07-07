@@ -16,8 +16,9 @@ type Session struct {
 	Agent     string `json:"agent"`
 	Needs     string `json:"needs"` // what a blocked session is waiting on
 	StartedAt int64  `json:"startedAt"`
-	Live      bool   `json:"live"`   // true if a live daemon worker (attachable); false for not-running sessions
-	Pinned    bool   `json:"pinned"` // true if the session is pinned in the agents view (ctrl+t)
+	Live      bool   `json:"live"`      // true if a live daemon worker (attachable); false for not-running sessions
+	Resumable bool   `json:"resumable"` // for a not-running session: true when it can be resumed in place (exited-but-resumable, vs really dead); always false while live
+	Pinned    bool   `json:"pinned"`    // true if the session is pinned in the agents view (ctrl+t)
 }
 
 // Busy reports whether the session is actively processing a turn, so input

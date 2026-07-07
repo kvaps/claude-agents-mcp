@@ -334,6 +334,57 @@ func (c *Client) ResumeInPlace(short string, dangerous bool) (ResumeOutcome, err
 	return ResumeOutcome{}, lastErr
 }
 
+// Resumable reports whether a not-running session can be brought back live in
+// place: it has on-disk job state carrying a session id and its saved working
+// directory still exists. This is what distinguishes an exited-but-resumable
+// session (continue it, keeping its context) from a really-dead one (fork it or
+// start fresh). A transcript is deliberately not required — the dispatch path
+// resumes even never-prompted sessions.
+func Resumable(short string) bool {
+	js, err := ReadJobState(short)
+	if err != nil {
+		return false
+	}
+	sid := js.ResumeSessionID
+	if sid == "" {
+		sid = js.SessionID
+	}
+	return sid != "" && !cwdMissing(js.Cwd)
+}
+
+// EnsureLive returns the session ready to receive input, transparently resuming
+// it in place first when it is not running — mirroring the app, where typing
+// into an exited session brings it back with its history. A live session is
+// returned as-is. The resumed session is additionally waited to its REPL prompt
+// so a follow-up submit/keystroke lands in a ready input box, not a booting
+// screen.
+func (c *Client) EnsureLive(sess Session) (Session, error) {
+	if sess.Live {
+		return sess, nil
+	}
+	if sess.Short == "" {
+		return Session{}, fmt.Errorf("session is not running and has no short id to resume by — use resume_session")
+	}
+	out, err := c.ResumeInPlace(sess.Short, false)
+	if errors.Is(err, ErrNoJobState) {
+		return Session{}, fmt.Errorf("session %s is not running and has no job state to resume in place — use resume_session (it can fork-resume by full session id)", sess.Short)
+	}
+	if err != nil {
+		return Session{}, fmt.Errorf("session %s is not running and auto-resume failed: %w", sess.Short, err)
+	}
+	if err := c.WaitReady(out.Short, 20*time.Second); err != nil {
+		return Session{}, fmt.Errorf("session %s was resumed but never settled at its prompt: %w", out.Short, err)
+	}
+	live, rerr := c.Resolve(out.Short)
+	if rerr != nil || !live.Live {
+		// The roster listed it moments ago (ResumeInPlace verified that); fall
+		// back to the outcome rather than failing the delivery.
+		live = sess
+		live.Live, live.State = true, out.State
+	}
+	return live, nil
+}
+
 // ResumeByCLI is the fallback for sessions with no on-disk job state (e.g. ones
 // no longer in the agents list): it runs `claude --bg --resume <sessionID>`,
 // which forks to a fresh short, verifies liveness, and removes the forked worker

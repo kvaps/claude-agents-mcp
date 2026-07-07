@@ -21,7 +21,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	// ---- session management ----
 
 	s.AddTool(mcp.NewTool("list_sessions",
-		mcp.WithDescription("List sessions exactly as the agents view shows them — including not-running ones (`live:false`). Running sessions carry live state (state, tempo, detail, needs) and a short id; pass live_only=true to return only running sessions."),
+		mcp.WithDescription("List sessions exactly as the agents view shows them — including not-running ones (`live:false`). Running sessions carry live state (state, tempo, detail, needs) and a short id; pass live_only=true to return only running sessions. For not-running sessions, `resumable:true` means the session is exited-but-resumable: it can be continued with its full history via resume_session or simply by submit_prompt/send_text (which auto-resume it in place) — prefer continuing such a session over forking or starting a fresh one. `resumable:false` on a not-running session means it is really dead (no job state, or its working directory is gone)."),
 		mcp.WithBoolean("live_only", mcp.Description("return only running (attachable) sessions")),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		jobs, err := a.List()
@@ -41,7 +41,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("get_session",
-		mcp.WithDescription("Get one session's details by short id, session id (prefix) or name."),
+		mcp.WithDescription("Get one session's details by short id, session id (prefix) or name. For a not-running session (`live:false`), `resumable:true` means it can be continued in place with its full history (via resume_session, or automatically by submit_prompt/send_text); `resumable:false` means it is really dead."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		sess, err := a.Resolve(r.GetString("session", ""))
@@ -164,7 +164,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("submit_prompt",
-		mcp.WithDescription("Deliver a prompt to a session and reliably submit it in one call (handles bracketed-paste for long/multi-line text, then verifies the turn actually started, retrying Enter once). Use this to (re)seed a session's task instead of send_text+send_keys. goal=true sends it as /goal."),
+		mcp.WithDescription("Deliver a prompt to a session and reliably submit it in one call (handles bracketed-paste for long/multi-line text, then verifies the turn actually started, retrying Enter once). Use this to (re)seed a session's task instead of send_text+send_keys. A session that is not running but resumable is transparently resumed in place first, keeping its full history — like typing into an exited session in the app — so there is no need to check liveness or call resume_session before continuing a conversation. goal=true sends it as /goal."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 		mcp.WithString("text", mcp.Required(), mcp.Description("prompt text to deliver and submit (may be long/multi-line)")),
 		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
@@ -173,10 +173,14 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		if _, err := a.SubmitPrompt(sess.Short, r.GetString("text", ""), r.GetBool("goal", false)); err != nil {
+		sess, note, err := ensureLive(a, sess)
+		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		return mcp.NewToolResultText("submitted to " + sess.Short + "; turn started"), nil
+		if _, err := a.SubmitPrompt(sess.Short, r.GetString("text", ""), r.GetBool("goal", false)); err != nil {
+			return mcp.NewToolResultError(note + err.Error()), nil
+		}
+		return mcp.NewToolResultText(note + "submitted to " + sess.Short + "; turn started"), nil
 	})
 
 	s.AddTool(mcp.NewTool("rename_session",
@@ -280,7 +284,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("send_text",
-		mcp.WithDescription("Type text into a session (e.g. a prompt). submit=true presses Enter. Fire-and-forget by default (returns immediately); pass wait=true to block until the screen settles and return it — otherwise use read_screen to see output."),
+		mcp.WithDescription("Type text into a session (e.g. a prompt). submit=true presses Enter. A session that is not running but resumable is transparently resumed in place first (full history kept), like typing into an exited session in the app. Fire-and-forget by default (returns immediately); pass wait=true to block until the screen settles and return it — otherwise use read_screen to see output."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 		mcp.WithString("text", mcp.Required(), mcp.Description("text to type")),
 		mcp.WithBoolean("submit", mcp.Description("press Enter after typing (default true)")),
@@ -290,12 +294,16 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		wait := r.GetBool("wait", false)
-		screen, err := a.SendText(sess.Short, r.GetString("text", ""), r.GetBool("submit", true), wait)
+		sess, note, err := ensureLive(a, sess)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		return mcp.NewToolResultText(sentResult(screen, wait)), nil
+		wait := r.GetBool("wait", false)
+		screen, err := a.SendText(sess.Short, r.GetString("text", ""), r.GetBool("submit", true), wait)
+		if err != nil {
+			return mcp.NewToolResultError(note + err.Error()), nil
+		}
+		return mcp.NewToolResultText(note + sentResult(screen, wait)), nil
 	})
 
 	s.AddTool(mcp.NewTool("send_keys",
@@ -317,7 +325,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("send_command",
-		mcp.WithDescription("Run a slash command in a session reliably: clears modals, waits for idle, types and submits. e.g. /remote-control, /goal, /compact, /clear."),
+		mcp.WithDescription("Run a slash command in a session reliably: clears modals, waits for idle, types and submits. e.g. /remote-control, /goal, /compact, /clear. A session that is not running but resumable is transparently resumed in place first (full history kept)."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 		mcp.WithString("command", mcp.Required(), mcp.Description("slash command, with or without the leading /")),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -325,11 +333,15 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		screen, err := a.SendCommand(sess.Short, r.GetString("command", ""))
+		sess, note, err := ensureLive(a, sess)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		return mcp.NewToolResultText(screen), nil
+		screen, err := a.SendCommand(sess.Short, r.GetString("command", ""))
+		if err != nil {
+			return mcp.NewToolResultError(note + err.Error()), nil
+		}
+		return mcp.NewToolResultText(note + screen), nil
 	})
 
 	s.AddTool(mcp.NewTool("cancel",
@@ -349,6 +361,22 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	return s
+}
+
+// ensureLive brings a delivery target live before input is sent to it: a live
+// session is returned as-is; a not-running-but-resumable one is transparently
+// resumed in place (mirroring the app, where typing into an exited session
+// brings it back with its history). The returned note, prepended to the tool
+// result, tells the caller a resume happened.
+func ensureLive(a *agents.Client, sess agents.Session) (agents.Session, string, error) {
+	if sess.Live {
+		return sess, "", nil
+	}
+	live, err := a.EnsureLive(sess)
+	if err != nil {
+		return agents.Session{}, "", err
+	}
+	return live, fmt.Sprintf("session %s was not running — auto-resumed in place; ", live.Short), nil
 }
 
 func jsonResult(v any) (*mcp.CallToolResult, error) {

@@ -161,6 +161,67 @@ func TestResumeDescriptorCarriesTranscriptPath(t *testing.T) {
 	})
 }
 
+func TestResumable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeState := func(t *testing.T, short, body string) {
+		t.Helper()
+		dir := filepath.Join(home, ".claude", "jobs", short)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if Resumable("nostate0") {
+		t.Error("a session with no job state must not be resumable")
+	}
+	writeState(t, "ok000000", `{"sessionId":"11111111-2222-3333-4444-555555555555","cwd":"`+home+`"}`)
+	if !Resumable("ok000000") {
+		t.Error("a session with a session id and a live cwd must be resumable")
+	}
+	writeState(t, "cwdgone0", `{"sessionId":"11111111-2222-3333-4444-555555555555","cwd":"`+filepath.Join(home, "deleted-worktree")+`"}`)
+	if Resumable("cwdgone0") {
+		t.Error("a session whose cwd is gone must not be resumable")
+	}
+	writeState(t, "nosid000", `{"cwd":"`+home+`"}`)
+	if Resumable("nosid000") {
+		t.Error("a session with no session id must not be resumable")
+	}
+}
+
+// TestEnsureLiveIntegration drives the real daemon: EnsureLive on a not-running
+// session must transparently resume it in place and hand back a live, input-
+// ready session (the auto-resume behind submit_prompt/send_text/send_command).
+// Gated behind AUTORESUME_IT_SHORT; the fixture is stopped back afterwards.
+func TestEnsureLiveIntegration(t *testing.T) {
+	short := os.Getenv("AUTORESUME_IT_SHORT")
+	if short == "" {
+		t.Skip("set AUTORESUME_IT_SHORT=<not-running session short> to run the live auto-resume test")
+	}
+	c := NewClient()
+	sess, err := c.Resolve(short)
+	if err != nil {
+		t.Fatalf("Resolve(%s): %v", short, err)
+	}
+	if sess.Live {
+		t.Fatalf("fixture %s is already live; stop it first", short)
+	}
+	live, err := c.EnsureLive(sess)
+	if err != nil {
+		t.Fatalf("EnsureLive(%s): %v", short, err)
+	}
+	t.Cleanup(func() { _ = Stop(live.Short) })
+	if !live.Live {
+		t.Errorf("EnsureLive returned a non-live session: %+v", live)
+	}
+	if live.Short != short {
+		t.Errorf("auto-resume changed the short: got %s, want %s (fork/duplicate)", live.Short, short)
+	}
+}
+
 func jobStatePath(t *testing.T, short string) string {
 	t.Helper()
 	dir, err := jobsDir()
