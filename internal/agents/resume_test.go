@@ -75,6 +75,92 @@ func TestReadJobStateMissingReturnsSentinel(t *testing.T) {
 	}
 }
 
+func TestFindTranscript(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sid := "11111111-2222-3333-4444-555555555555"
+	proj := filepath.Join(home, ".claude", "projects", "-some-worktree-project")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(proj, sid+".jsonl")
+	if err := os.WriteFile(transcript, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("linkScanPath matching the sid wins", func(t *testing.T) {
+		got := findTranscript(&JobState{LinkScanPath: transcript}, sid)
+		if got != transcript {
+			t.Errorf("got %q, want %q", got, transcript)
+		}
+	})
+	t.Run("linkScanPath for another sid is ignored, search still finds it", func(t *testing.T) {
+		stale := filepath.Join(proj, "99999999-8888-7777-6666-555555555555.jsonl")
+		got := findTranscript(&JobState{LinkScanPath: stale}, sid)
+		if got != transcript {
+			t.Errorf("got %q, want %q", got, transcript)
+		}
+	})
+	t.Run("no transcript anywhere returns empty", func(t *testing.T) {
+		got := findTranscript(&JobState{}, "00000000-0000-0000-0000-000000000000")
+		if got != "" {
+			t.Errorf("got %q, want empty", got)
+		}
+	})
+}
+
+func TestResumeDescriptorCarriesTranscriptPath(t *testing.T) {
+	// The regression this guards: a dispatch descriptor without
+	// launch.transcriptPath makes the resumed worker look its conversation up in
+	// the project dir derived from the launch cwd, which fails (exit 1,
+	// exit_with_message, crash loop) for any session whose transcript lives under
+	// a different project dir — e.g. one that switched into a worktree.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sid := "11111111-2222-3333-4444-555555555555"
+	proj := filepath.Join(home, ".claude", "projects", "-elsewhere")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(proj, sid+".jsonl")
+	if err := os.WriteFile(transcript, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	js := &JobState{SessionID: sid, Cwd: home, LinkScanPath: transcript}
+	desc, err := resumeDescriptor("11111111", js, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch, ok := desc["launch"].(map[string]any)
+	if !ok {
+		t.Fatalf("descriptor has no launch map: %v", desc)
+	}
+	if got := launch["transcriptPath"]; got != transcript {
+		t.Errorf("launch.transcriptPath = %v, want %q", got, transcript)
+	}
+	if got := launch["sessionId"]; got != sid {
+		t.Errorf("launch.sessionId = %v, want %q", got, sid)
+	}
+
+	t.Run("omitted when no transcript exists", func(t *testing.T) {
+		js := &JobState{SessionID: "00000000-0000-0000-0000-000000000000", Cwd: home}
+		desc, err := resumeDescriptor("00000000", js, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		launch := desc["launch"].(map[string]any)
+		if _, present := launch["transcriptPath"]; present {
+			t.Errorf("transcriptPath should be omitted when no transcript is found: %v", launch)
+		}
+	})
+	t.Run("errors without a session id", func(t *testing.T) {
+		if _, err := resumeDescriptor("shortid0", &JobState{}, false); err == nil {
+			t.Error("expected an error for a job state with no session id")
+		}
+	})
+}
+
 func jobStatePath(t *testing.T, short string) string {
 	t.Helper()
 	dir, err := jobsDir()
