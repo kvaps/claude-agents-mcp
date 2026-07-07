@@ -30,10 +30,10 @@ The server speaks MCP over stdio.
 
 Session management:
 
-- `list_sessions` — every session the agents view shows, **including not-running ones** (`live:false`); running ones carry live state (`state`, `tempo`, `detail`, `needs`), short id, `cwd`, `name`, and a `pinned` flag. `live_only=true` filters to running sessions
-- `get_session` — one session by short id / session id / name
+- `list_sessions` — every session the agents view shows, **including not-running ones** (`live:false`); running ones carry live state (`state`, `tempo`, `detail`, `needs`), short id, `cwd`, `name`, and a `pinned` flag. Not-running ones carry a `resumable` flag distinguishing **exited-but-resumable** (can be continued in place with full history — prefer that over forking or starting fresh) from **really dead** (no job state, or its working directory is gone). `live_only=true` filters to running sessions
+- `get_session` — one session by short id / session id / name (same `resumable` flag as `list_sessions`)
 - `create_session` — `claude --bg` in a directory (optional name, dangerous mode); with `prompt` it delivers and reliably submits the task so the agent starts immediately (`goal=true` sends it as `/goal`)
-- `submit_prompt` — deliver a prompt to a session and reliably submit it in one call (handles long/multi-line bracketed-paste, verifies the turn started, retries Enter once); `goal=true` sends `/goal`
+- `submit_prompt` — deliver a prompt to a session and reliably submit it in one call (handles long/multi-line bracketed-paste, verifies the turn started, retries Enter once); a not-running-but-resumable session is transparently resumed in place first, like typing into an exited session in the app; `goal=true` sends `/goal`
 - `resume_session` — bring a not-running session back to life **in place** (the same way the agents view does it) and **return only once the worker is verified live**, so you never attach to a job that "already exited". It resumes under the session's own short with the same session id — no fork, no duplicate entry — unlike a raw `claude --bg --resume`, which spawns a worker under a fresh short and leaves the original behind. It validates the saved working directory first (a deleted worktree is the most common resume crash) and cleans up the worker it started on any failure, so nothing is left as garbage. Refuses to resume an already-live session. Accepts a name, short id, or full session id (a full id still works for sessions no longer in the agents list, via a CLI fallback that forks to a fresh short); optional `prompt` is delivered once it settles (`goal=true` sends `/goal`)
 - `fork_session` — fork a session into a **new, independent** background session that carries **all of the source's history up to the moment of the fork**. The fork shows up in the agents view as its own entry (new short, new session id) and can be driven immediately; the source is never touched. It uses Claude Code's native `--fork-session` (`claude --bg --resume <id> --fork-session`), so the whole transcript is forked correctly — not a shallow copy — and the fork inherits the source's working directory. Accepts a name, short id, or session id for the source; optional `name` for the fork; optional `prompt` is delivered once it settles (`goal=true` sends `/goal`)
 - `rename_session` — set a session's custom title (`ctrl+r` in the agents view)
@@ -44,9 +44,9 @@ Session management:
 Attach — everything a human can do inside a session:
 
 - `read_screen` — current screen as plain text
-- `send_text` — type text into a session (fire-and-forget by default; `wait=true` blocks and returns the settled screen)
+- `send_text` — type text into a session (fire-and-forget by default; `wait=true` blocks and returns the settled screen); auto-resumes a not-running-but-resumable session in place first
 - `send_keys` — named keys (fire-and-forget; `wait=true` to block): `enter esc tab space backspace delete up down left right home end pageup pagedown ctrl-c ctrl-d ctrl-u ctrl-l ctrl-z ctrl-r`
-- `send_command` — run a slash command reliably (clears modals → waits for idle → types → submits): `/remote-control`, `/goal`, `/compact`, …
+- `send_command` — run a slash command reliably (clears modals → waits for idle → types → submits): `/remote-control`, `/goal`, `/compact`, …; auto-resumes a not-running-but-resumable session in place first
 - `cancel` — interrupt the current task (Esc, or Ctrl-C with `hard=true`)
 
 ## Status
@@ -57,7 +57,9 @@ Attach — everything a human can do inside a session:
 - [x] Get a single session
 - [x] Create a session (`claude --bg`), optionally delivering + submitting a starting prompt (or `/goal`)
 - [x] Reliably deliver + submit a prompt (`submit_prompt`): bracketed-paste for long/multi-line, verify the turn started
-- [x] Resume a not-running session (`resume_session`): in-place daemon dispatch (own short, same session id, no fork/duplicate), validate the saved cwd first, verify liveness before returning, clean up the worker on any failure
+- [x] Resume a not-running session (`resume_session`): in-place daemon dispatch (own short, same session id, no fork/duplicate), validate the saved cwd first, pass the transcript path so the worker finds its conversation regardless of cwd, verify liveness before returning, clean up the worker on any failure
+- [x] Auto-resume on input: `submit_prompt` / `send_text` / `send_command` into an exited-but-resumable session transparently resume it in place first (like typing into an exited session in the app)
+- [x] `resumable` flag on not-running sessions (`list_sessions` / `get_session`): exited-but-resumable vs really dead, so an orchestrator continues instead of forking
 - [x] Fork a session (`fork_session`): native `--fork-session` into a new entry (new short + session id) carrying the source's full history, source untouched, verify liveness before returning, clean up the worker on any failure
 - [x] Rename a session (`ctrl+r`; custom title via `.meta.json` sidecar)
 - [x] Pin / unpin a session (`ctrl+t`; agents-view pin set in `~/.claude/jobs/pins.json`)
@@ -87,6 +89,7 @@ Attach — everything a human can do inside a session:
 - attach actions open the daemon's `op:attach` raw PTY stream and write keystrokes — the exact same channel as the human keyboard. Reads come back from the same stream (or `op:subscribe` for `read_screen`).
 - create / stop / remove shell out to the stable public `claude` CLI.
 - resume goes through the daemon, not the CLI. `claude --bg --resume` is the wrong tool here: it forks the session — spawning a worker under a fresh short with a new session id and leaving the original as a duplicate not-running entry — and it crashes deterministically (the daemon does not retry) when the session has no transcript ("No conversation found") or its saved cwd is gone ("working directory no longer exists", e.g. a deleted worktree). Instead `resume_session` does exactly what pressing Enter on a session in the agents view does: it sends the daemon an `op:dispatch` with `launch.mode:"resume"` under the session's **own** short, so the session simply goes live in place (same id, single entry). It reconstructs the dispatch descriptor from the session's on-disk job state (`~/.claude/jobs/<short>/state.json`) and authenticates with the daemon control key, validates the saved cwd up front, polls the roster until the worker holds a usable state, and stops the worker on any failure so no crashed/idle session is left behind. Sessions with no on-disk job state (no longer in the agents list) fall back to the CLI resume.
+- the dispatch descriptor must carry `launch.transcriptPath`. The resumed worker's `--resume <sessionId>` lookup only searches the project directory derived from the launch `cwd` (`~/.claude/projects/<sanitized-cwd>/`), so a session whose transcript lives under a different project dir — typically one that switched into a worktree mid-run — exits at startup with "No conversation found" (`exit 1`, `exit_with_message`) and crash-loops, even though the same session resumes fine from the agents view. The picker avoids this by passing the transcript path explicitly in the descriptor; `resume_session` derives the same path from the job state's `linkScanPath` (falling back to a `~/.claude/projects/*/<sessionId>.jsonl` search) and omits it only when no transcript exists yet.
 - pin / reorder are **not** daemon ops — the agents-view picker keeps them on disk under `~/.claude/jobs`: the pin set in `pins.json` (a JSON array of short ids, written under a lock) and per-session sort keys in `<id>/order` and `<id>/stateOrder`. `pin_session` / `reorder_session` write exactly those files, so the change is durable and any picker reflects it.
 
 Slash commands only work over the raw PTY (`op:attach`): they are REPL input, not conversation messages, so they cannot be delivered through any message/dispatch channel.

@@ -136,6 +136,7 @@ func (c *Client) List() ([]Session, error) {
 			Cwd:       a.Cwd,
 			State:     a.StatusStr(),
 			Live:      false,
+			Resumable: Resumable(a.ID),
 		})
 	}
 	// Any live sessions that the agents view did not list (rare): append them.

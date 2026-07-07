@@ -30,6 +30,7 @@ type JobState struct {
 	ResumeSessionID string   `json:"resumeSessionId"`
 	RespawnFlags    []string `json:"respawnFlags"`
 	Cwd             string   `json:"cwd"`
+	LinkScanPath    string   `json:"linkScanPath"`
 	Name            string   `json:"name"`
 	Intent          string   `json:"intent"`
 	DaemonShort     string   `json:"daemonShort"`
@@ -92,6 +93,83 @@ func resumeFlags(js *JobState, dangerous bool) []string {
 	return append(flags, "--dangerously-skip-permissions")
 }
 
+// findTranscript locates the on-disk transcript (~/.claude/projects/<project>/
+// <sid>.jsonl) for the session being resumed. The resumed worker's `--resume
+// <sessionId>` lookup only searches the project directory derived from the
+// launch cwd, which misses transcripts living under another project dir — e.g. a
+// session that switched into a worktree mid-run, so its job cwd no longer maps
+// to where its transcript is kept. Such a resume exits with "No conversation
+// found" (exit 1, exit_with_message) and crash-loops. The agents-view picker
+// avoids this by passing launch.transcriptPath explicitly; this derives the same
+// path: the job state's linkScanPath (the transcript the daemon itself scans)
+// when it matches the session id, else a search across ~/.claude/projects.
+// Returns "" when no transcript exists (e.g. a never-prompted session) — the
+// dispatch then proceeds without the hint and the worker falls back to its own
+// cwd-derived lookup.
+func findTranscript(js *JobState, sid string) string {
+	if p := js.LinkScanPath; p != "" && filepath.Base(p) == sid+".jsonl" {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	matches, _ := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", sid+".jsonl"))
+	if len(matches) == 0 {
+		return ""
+	}
+	newest := matches[0]
+	var newestMod time.Time
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && fi.ModTime().After(newestMod) {
+			newest, newestMod = m, fi.ModTime()
+		}
+	}
+	return newest
+}
+
+// resumeDescriptor builds the op:dispatch descriptor for an in-place resume,
+// mirroring what the agents-view picker sends (see the roster.json `dispatch`
+// field of any live picker-resumed worker). launch.transcriptPath is included
+// whenever the transcript can be located — without it a worker whose transcript
+// lives outside its cwd-derived project dir cannot find its conversation and
+// exits at startup.
+func resumeDescriptor(short string, js *JobState, dangerous bool) (map[string]any, error) {
+	sid := js.ResumeSessionID
+	if sid == "" {
+		sid = js.SessionID
+	}
+	if sid == "" {
+		return nil, fmt.Errorf("session %s has no sessionId on disk", short)
+	}
+	flags := resumeFlags(js, dangerous)
+	launch := map[string]any{
+		"mode":      "resume",
+		"sessionId": sid,
+		"fork":      false,
+		"flagArgs":  flags,
+	}
+	if p := findTranscript(js, sid); p != "" {
+		launch["transcriptPath"] = p
+	}
+	return map[string]any{
+		"proto":        1,
+		"short":        short,
+		"nonce":        randID()[:8],
+		"sessionId":    js.SessionID,
+		"createdAt":    time.Now().UnixMilli(),
+		"source":       "fleet",
+		"cwd":          js.Cwd,
+		"launch":       launch,
+		"env":          map[string]any{},
+		"isolation":    "none",
+		"respawnFlags": flags,
+		"seed":         map[string]any{"intent": js.Intent, "name": js.Name},
+	}, nil
+}
+
 // DispatchResume asks the daemon to resume a not-running session in place: under
 // its own short, with the same sessionId, no fork and no duplicate roster entry
 // — exactly what pressing Enter on a session in the agents view does (it sends
@@ -108,32 +186,9 @@ func (c *Client) DispatchResume(short string, js *JobState, dangerous bool) (str
 	if err != nil {
 		return "", err
 	}
-	sid := js.ResumeSessionID
-	if sid == "" {
-		sid = js.SessionID
-	}
-	if sid == "" {
-		return "", fmt.Errorf("session %s has no sessionId on disk", short)
-	}
-	flags := resumeFlags(js, dangerous)
-	desc := map[string]any{
-		"proto":     1,
-		"short":     short,
-		"nonce":     randID()[:8],
-		"sessionId": js.SessionID,
-		"createdAt": time.Now().UnixMilli(),
-		"source":    "fleet",
-		"cwd":       js.Cwd,
-		"launch": map[string]any{
-			"mode":      "resume",
-			"sessionId": sid,
-			"fork":      false,
-			"flagArgs":  flags,
-		},
-		"env":          map[string]any{},
-		"isolation":    "none",
-		"respawnFlags": flags,
-		"seed":         map[string]any{"intent": js.Intent, "name": js.Name},
+	desc, err := resumeDescriptor(short, js, dangerous)
+	if err != nil {
+		return "", err
 	}
 	raw, err := c.request(map[string]any{
 		"proto": 1, "op": "dispatch", "d": desc, "timeoutMs": 5000, "auth": key,
@@ -277,6 +332,57 @@ func (c *Client) ResumeInPlace(short string, dangerous bool) (ResumeOutcome, err
 		_ = Stop(rshort) // normalise the failed worker back to not-running; no orphan
 	}
 	return ResumeOutcome{}, lastErr
+}
+
+// Resumable reports whether a not-running session can be brought back live in
+// place: it has on-disk job state carrying a session id and its saved working
+// directory still exists. This is what distinguishes an exited-but-resumable
+// session (continue it, keeping its context) from a really-dead one (fork it or
+// start fresh). A transcript is deliberately not required — the dispatch path
+// resumes even never-prompted sessions.
+func Resumable(short string) bool {
+	js, err := ReadJobState(short)
+	if err != nil {
+		return false
+	}
+	sid := js.ResumeSessionID
+	if sid == "" {
+		sid = js.SessionID
+	}
+	return sid != "" && !cwdMissing(js.Cwd)
+}
+
+// EnsureLive returns the session ready to receive input, transparently resuming
+// it in place first when it is not running — mirroring the app, where typing
+// into an exited session brings it back with its history. A live session is
+// returned as-is. The resumed session is additionally waited to its REPL prompt
+// so a follow-up submit/keystroke lands in a ready input box, not a booting
+// screen.
+func (c *Client) EnsureLive(sess Session) (Session, error) {
+	if sess.Live {
+		return sess, nil
+	}
+	if sess.Short == "" {
+		return Session{}, fmt.Errorf("session is not running and has no short id to resume by — use resume_session")
+	}
+	out, err := c.ResumeInPlace(sess.Short, false)
+	if errors.Is(err, ErrNoJobState) {
+		return Session{}, fmt.Errorf("session %s is not running and has no job state to resume in place — use resume_session (it can fork-resume by full session id)", sess.Short)
+	}
+	if err != nil {
+		return Session{}, fmt.Errorf("session %s is not running and auto-resume failed: %w", sess.Short, err)
+	}
+	if err := c.WaitReady(out.Short, 20*time.Second); err != nil {
+		return Session{}, fmt.Errorf("session %s was resumed but never settled at its prompt: %w", out.Short, err)
+	}
+	live, rerr := c.Resolve(out.Short)
+	if rerr != nil || !live.Live {
+		// The roster listed it moments ago (ResumeInPlace verified that); fall
+		// back to the outcome rather than failing the delivery.
+		live = sess
+		live.Live, live.State = true, out.State
+	}
+	return live, nil
 }
 
 // ResumeByCLI is the fallback for sessions with no on-disk job state (e.g. ones

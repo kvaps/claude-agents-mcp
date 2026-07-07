@@ -75,6 +75,153 @@ func TestReadJobStateMissingReturnsSentinel(t *testing.T) {
 	}
 }
 
+func TestFindTranscript(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sid := "11111111-2222-3333-4444-555555555555"
+	proj := filepath.Join(home, ".claude", "projects", "-some-worktree-project")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(proj, sid+".jsonl")
+	if err := os.WriteFile(transcript, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("linkScanPath matching the sid wins", func(t *testing.T) {
+		got := findTranscript(&JobState{LinkScanPath: transcript}, sid)
+		if got != transcript {
+			t.Errorf("got %q, want %q", got, transcript)
+		}
+	})
+	t.Run("linkScanPath for another sid is ignored, search still finds it", func(t *testing.T) {
+		stale := filepath.Join(proj, "99999999-8888-7777-6666-555555555555.jsonl")
+		got := findTranscript(&JobState{LinkScanPath: stale}, sid)
+		if got != transcript {
+			t.Errorf("got %q, want %q", got, transcript)
+		}
+	})
+	t.Run("no transcript anywhere returns empty", func(t *testing.T) {
+		got := findTranscript(&JobState{}, "00000000-0000-0000-0000-000000000000")
+		if got != "" {
+			t.Errorf("got %q, want empty", got)
+		}
+	})
+}
+
+func TestResumeDescriptorCarriesTranscriptPath(t *testing.T) {
+	// The regression this guards: a dispatch descriptor without
+	// launch.transcriptPath makes the resumed worker look its conversation up in
+	// the project dir derived from the launch cwd, which fails (exit 1,
+	// exit_with_message, crash loop) for any session whose transcript lives under
+	// a different project dir — e.g. one that switched into a worktree.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sid := "11111111-2222-3333-4444-555555555555"
+	proj := filepath.Join(home, ".claude", "projects", "-elsewhere")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(proj, sid+".jsonl")
+	if err := os.WriteFile(transcript, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	js := &JobState{SessionID: sid, Cwd: home, LinkScanPath: transcript}
+	desc, err := resumeDescriptor("11111111", js, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launch, ok := desc["launch"].(map[string]any)
+	if !ok {
+		t.Fatalf("descriptor has no launch map: %v", desc)
+	}
+	if got := launch["transcriptPath"]; got != transcript {
+		t.Errorf("launch.transcriptPath = %v, want %q", got, transcript)
+	}
+	if got := launch["sessionId"]; got != sid {
+		t.Errorf("launch.sessionId = %v, want %q", got, sid)
+	}
+
+	t.Run("omitted when no transcript exists", func(t *testing.T) {
+		js := &JobState{SessionID: "00000000-0000-0000-0000-000000000000", Cwd: home}
+		desc, err := resumeDescriptor("00000000", js, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		launch := desc["launch"].(map[string]any)
+		if _, present := launch["transcriptPath"]; present {
+			t.Errorf("transcriptPath should be omitted when no transcript is found: %v", launch)
+		}
+	})
+	t.Run("errors without a session id", func(t *testing.T) {
+		if _, err := resumeDescriptor("shortid0", &JobState{}, false); err == nil {
+			t.Error("expected an error for a job state with no session id")
+		}
+	})
+}
+
+func TestResumable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeState := func(t *testing.T, short, body string) {
+		t.Helper()
+		dir := filepath.Join(home, ".claude", "jobs", short)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if Resumable("nostate0") {
+		t.Error("a session with no job state must not be resumable")
+	}
+	writeState(t, "ok000000", `{"sessionId":"11111111-2222-3333-4444-555555555555","cwd":"`+home+`"}`)
+	if !Resumable("ok000000") {
+		t.Error("a session with a session id and a live cwd must be resumable")
+	}
+	writeState(t, "cwdgone0", `{"sessionId":"11111111-2222-3333-4444-555555555555","cwd":"`+filepath.Join(home, "deleted-worktree")+`"}`)
+	if Resumable("cwdgone0") {
+		t.Error("a session whose cwd is gone must not be resumable")
+	}
+	writeState(t, "nosid000", `{"cwd":"`+home+`"}`)
+	if Resumable("nosid000") {
+		t.Error("a session with no session id must not be resumable")
+	}
+}
+
+// TestEnsureLiveIntegration drives the real daemon: EnsureLive on a not-running
+// session must transparently resume it in place and hand back a live, input-
+// ready session (the auto-resume behind submit_prompt/send_text/send_command).
+// Gated behind AUTORESUME_IT_SHORT; the fixture is stopped back afterwards.
+func TestEnsureLiveIntegration(t *testing.T) {
+	short := os.Getenv("AUTORESUME_IT_SHORT")
+	if short == "" {
+		t.Skip("set AUTORESUME_IT_SHORT=<not-running session short> to run the live auto-resume test")
+	}
+	c := NewClient()
+	sess, err := c.Resolve(short)
+	if err != nil {
+		t.Fatalf("Resolve(%s): %v", short, err)
+	}
+	if sess.Live {
+		t.Fatalf("fixture %s is already live; stop it first", short)
+	}
+	live, err := c.EnsureLive(sess)
+	if err != nil {
+		t.Fatalf("EnsureLive(%s): %v", short, err)
+	}
+	t.Cleanup(func() { _ = Stop(live.Short) })
+	if !live.Live {
+		t.Errorf("EnsureLive returned a non-live session: %+v", live)
+	}
+	if live.Short != short {
+		t.Errorf("auto-resume changed the short: got %s, want %s (fork/duplicate)", live.Short, short)
+	}
+}
+
 func jobStatePath(t *testing.T, short string) string {
 	t.Helper()
 	dir, err := jobsDir()
