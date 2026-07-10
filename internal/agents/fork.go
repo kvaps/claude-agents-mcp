@@ -31,8 +31,11 @@ type ForkOutcome struct {
 // the same daemon-registration path create_session uses, so the fork shows up in
 // `claude agents` like any other background session.
 //
+// An optional model is passed through as `--model` so the fork can run on a
+// different model than the source (the claude CLI validates the value).
+//
 // It returns the command output, which carries the new session's short id.
-func Fork(sessionID, cwd, name string, dangerous bool) (string, error) {
+func Fork(sessionID, cwd, name, model string, dangerous bool) (string, error) {
 	if strings.TrimSpace(sessionID) == "" {
 		return "", fmt.Errorf("source session id is required")
 	}
@@ -49,6 +52,9 @@ func Fork(sessionID, cwd, name string, dangerous bool) (string, error) {
 	args := []string{"--bg", "--resume", sessionID, "--fork-session"}
 	if name != "" {
 		args = append(args, "--name", name)
+	}
+	if model != "" {
+		args = append(args, "--model", model)
 	}
 	if dangerous {
 		args = append(args, "--dangerously-skip-permissions")
@@ -68,8 +74,8 @@ func Fork(sessionID, cwd, name string, dangerous bool) (string, error) {
 // settle (a fork replays the whole source transcript, so it sits in "resuming"
 // for a moment), and on failure removes the half-spawned worker so no
 // crashed/idle orphan is left behind. The source session is never modified.
-func (c *Client) ForkSession(srcSessionID, srcCwd, name string, dangerous bool) (ForkOutcome, error) {
-	out, err := Fork(srcSessionID, srcCwd, name, dangerous)
+func (c *Client) ForkSession(srcSessionID, srcCwd, name, model string, dangerous bool) (ForkOutcome, error) {
+	out, err := Fork(srcSessionID, srcCwd, name, model, dangerous)
 	if err != nil {
 		return ForkOutcome{}, err
 	}

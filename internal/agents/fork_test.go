@@ -30,7 +30,7 @@ func TestForkValidation(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if _, err := Fork(c.sessionID, c.cwd, "", false); err == nil {
+			if _, err := Fork(c.sessionID, c.cwd, "", "", false); err == nil {
 				t.Fatalf("Fork(%q, %q) = nil error, want a validation error", c.sessionID, c.cwd)
 			}
 		})
@@ -52,7 +52,7 @@ func TestForkSessionIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve source %q: %v", ref, err)
 	}
-	out, err := c.ForkSession(src.SessionID, src.Cwd, "fork-it-test", true)
+	out, err := c.ForkSession(src.SessionID, src.Cwd, "fork-it-test", "", true)
 	if err != nil {
 		t.Fatalf("ForkSession(%s): %v", src.Short, err)
 	}

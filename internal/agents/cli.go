@@ -81,9 +81,10 @@ func claudePath() (string, error) {
 	return "", fmt.Errorf("claude CLI not found in PATH")
 }
 
-// Create dispatches a new background session in cwd with an optional name.
+// Create dispatches a new background session in cwd with an optional name and
+// an optional model (passed through as `--model`; the claude CLI validates it).
 // It returns the command output (which includes the new session id).
-func Create(cwd, name string, dangerous bool) (string, error) {
+func Create(cwd, name, model string, dangerous bool) (string, error) {
 	if cwd == "" {
 		return "", fmt.Errorf("cwd is required")
 	}
@@ -97,6 +98,9 @@ func Create(cwd, name string, dangerous bool) (string, error) {
 	args := []string{"--bg"}
 	if name != "" {
 		args = append(args, "--name", name)
+	}
+	if model != "" {
+		args = append(args, "--model", model)
 	}
 	if dangerous {
 		args = append(args, "--dangerously-skip-permissions")
@@ -116,7 +120,7 @@ func Create(cwd, name string, dangerous bool) (string, error) {
 // live spawns a second worker the daemon then retires (it keeps one worker per
 // session), so the returned short can be dead on arrival — callers must verify
 // liveness first (resume_session checks the roster and waits via WaitLive).
-func Resume(sessionID string, dangerous bool) (string, error) {
+func Resume(sessionID, model string, dangerous bool) (string, error) {
 	if strings.TrimSpace(sessionID) == "" {
 		return "", fmt.Errorf("session id is required")
 	}
@@ -125,6 +129,9 @@ func Resume(sessionID string, dangerous bool) (string, error) {
 		return "", err
 	}
 	args := []string{"--bg", "--resume", sessionID}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
 	if dangerous {
 		args = append(args, "--dangerously-skip-permissions")
 	}

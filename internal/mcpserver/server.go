@@ -52,14 +52,15 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("create_session",
-		mcp.WithDescription("Create a new background session in a directory (runs `claude --bg`). With prompt set, the task is delivered and reliably submitted so the agent starts immediately (no separate send_text+Enter, no getting stuck idle). goal=true sends it as /goal."),
+		mcp.WithDescription("Create a new background session in a directory (runs `claude --bg`). With model set, the session runs on that model (passed as `--model`; alias like sonnet/opus/haiku or a full model id — the claude CLI validates it). With prompt set, the task is delivered and reliably submitted so the agent starts immediately (no separate send_text+Enter, no getting stuck idle). goal=true sends it as /goal."),
 		mcp.WithString("cwd", mcp.Required(), mcp.Description("working directory for the session")),
 		mcp.WithString("name", mcp.Description("display name for the session")),
+		mcp.WithString("model", mcp.Description("model for the session: an alias (sonnet, opus, haiku) or a full model id; omit for the default")),
 		mcp.WithBoolean("dangerous", mcp.Description("pass --dangerously-skip-permissions")),
 		mcp.WithString("prompt", mcp.Description("task to deliver and submit once the session is up (may be long/multi-line)")),
 		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		out, err := agents.Create(r.GetString("cwd", ""), r.GetString("name", ""), r.GetBool("dangerous", false))
+		out, err := agents.Create(r.GetString("cwd", ""), r.GetString("name", ""), r.GetString("model", ""), r.GetBool("dangerous", false))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -81,13 +82,15 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("resume_session",
-		mcp.WithDescription("Bring a not-running session back to life and only return once the worker is verified live — never a job that 'already exited'. It resumes the session IN PLACE via the daemon, the same way the agents view does: under the session's own short, same session id, with no fork and no duplicate entry in the list (unlike a raw `claude --bg --resume`, which spawns a worker under a fresh short and leaves the original behind). It validates the session's saved working directory first — a deleted worktree is the most common resume crash — and returns a clear error instead of spawning a doomed worker, and on any failure it cleans up the worker it started so no crashed/idle session is left as garbage. It refuses to resume a session that is already live. Accepts a name, short id, or full session id (a full id still works for sessions no longer in the agents list, via a CLI fallback that forks to a fresh short). With prompt set, the task is delivered and submitted once the resumed session settles at its prompt (best-effort; goal=true sends it as /goal)."),
+		mcp.WithDescription("Bring a not-running session back to life and only return once the worker is verified live — never a job that 'already exited'. It resumes the session IN PLACE via the daemon, the same way the agents view does: under the session's own short, same session id, with no fork and no duplicate entry in the list (unlike a raw `claude --bg --resume`, which spawns a worker under a fresh short and leaves the original behind). It validates the session's saved working directory first — a deleted worktree is the most common resume crash — and returns a clear error instead of spawning a doomed worker, and on any failure it cleans up the worker it started so no crashed/idle session is left as garbage. It refuses to resume a session that is already live. Accepts a name, short id, or full session id (a full id still works for sessions no longer in the agents list, via a CLI fallback that forks to a fresh short). With model set, the session is resumed on that model (passed as `--model`, replacing any model it was originally launched with; alias or full model id — the claude CLI validates it). With prompt set, the task is delivered and submitted once the resumed session settles at its prompt (best-effort; goal=true sends it as /goal)."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("session id, short id, or name to resume")),
 		mcp.WithString("prompt", mcp.Description("task to deliver and submit once the session is ready (best-effort; optional)")),
 		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
+		mcp.WithString("model", mcp.Description("model to resume on: an alias (sonnet, opus, haiku) or a full model id; overrides the session's original model, omit to keep it")),
 		mcp.WithBoolean("dangerous", mcp.Description("pass --dangerously-skip-permissions")),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		ref := r.GetString("session", "")
+		model := r.GetString("model", "")
 		dangerous := r.GetBool("dangerous", false)
 		sess, rerr := a.Resolve(ref)
 		if rerr == nil && sess.Live {
@@ -103,12 +106,12 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		var err error
 		switch {
 		case rerr == nil && sess.Short != "":
-			out, err = a.ResumeInPlace(sess.Short, dangerous)
+			out, err = a.ResumeInPlace(sess.Short, model, dangerous)
 			if errors.Is(err, agents.ErrNoJobState) {
-				out, err = a.ResumeByCLI(sess.SessionID, dangerous)
+				out, err = a.ResumeByCLI(sess.SessionID, model, dangerous)
 			}
 		case agents.IsFullSessionID(ref):
-			out, err = a.ResumeByCLI(ref, dangerous)
+			out, err = a.ResumeByCLI(ref, model, dangerous)
 		default:
 			return mcp.NewToolResultError(rerr.Error()), nil
 		}
@@ -131,9 +134,10 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("fork_session",
-		mcp.WithDescription("Fork a session into a new, independent background session that carries ALL of the source's history up to the moment of the fork. The fork shows up in `claude agents` as its own entry (new short id, new session id) and can be driven immediately; the source session is never touched. Uses Claude Code's native --fork-session, so the full transcript is forked correctly (not a shallow copy). The fork inherits the source's working directory. Accepts a name, short id, or full session id for the source. With prompt set, the task is delivered and submitted once the fork settles at its prompt (best-effort; goal=true sends it as /goal)."),
+		mcp.WithDescription("Fork a session into a new, independent background session that carries ALL of the source's history up to the moment of the fork. The fork shows up in `claude agents` as its own entry (new short id, new session id) and can be driven immediately; the source session is never touched. Uses Claude Code's native --fork-session, so the full transcript is forked correctly (not a shallow copy). The fork inherits the source's working directory. Accepts a name, short id, or full session id for the source. With model set, the fork runs on that model (passed as `--model`; alias or full model id — the claude CLI validates it), independent of the source's model. With prompt set, the task is delivered and submitted once the fork settles at its prompt (best-effort; goal=true sends it as /goal)."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("source session to fork: short id, session id, or name")),
 		mcp.WithString("name", mcp.Description("display name for the new forked session")),
+		mcp.WithString("model", mcp.Description("model for the fork: an alias (sonnet, opus, haiku) or a full model id; omit to keep the default")),
 		mcp.WithString("prompt", mcp.Description("task to deliver and submit once the fork is ready (best-effort; optional)")),
 		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
 		mcp.WithBoolean("dangerous", mcp.Description("pass --dangerously-skip-permissions")),
@@ -145,7 +149,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		if sess.SessionID == "" {
 			return mcp.NewToolResultError("source session has no session id on disk; cannot fork"), nil
 		}
-		out, err := a.ForkSession(sess.SessionID, sess.Cwd, r.GetString("name", ""), r.GetBool("dangerous", false))
+		out, err := a.ForkSession(sess.SessionID, sess.Cwd, r.GetString("name", ""), r.GetString("model", ""), r.GetBool("dangerous", false))
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("fork failed: %v. The source session %s is intact", err, sess.Short)), nil
 		}

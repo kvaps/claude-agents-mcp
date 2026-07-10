@@ -79,9 +79,10 @@ func controlKey() (string, error) {
 
 // resumeFlags derives the launch flags for a resume from the session's saved
 // respawnFlags, adding bypass-permissions when the caller asked for it and the
-// session was not already launched with a permission mode.
-func resumeFlags(js *JobState, dangerous bool) []string {
-	flags := append([]string{}, js.RespawnFlags...)
+// session was not already launched with a permission mode, and overriding the
+// model when the caller picked one explicitly.
+func resumeFlags(js *JobState, model string, dangerous bool) []string {
+	flags := withModelOverride(js.RespawnFlags, model)
 	if !dangerous {
 		return flags
 	}
@@ -91,6 +92,28 @@ func resumeFlags(js *JobState, dangerous bool) []string {
 		}
 	}
 	return append(flags, "--dangerously-skip-permissions")
+}
+
+// withModelOverride returns a copy of flags with the model applied: any saved
+// --model flag (both the "--model X" and "--model=X" forms) is dropped and the
+// caller's model appended, so an explicit choice wins over whatever the session
+// was originally launched with. An empty model keeps the flags untouched.
+func withModelOverride(flags []string, model string) []string {
+	out := make([]string, 0, len(flags)+2)
+	if model == "" {
+		return append(out, flags...)
+	}
+	for i := 0; i < len(flags); i++ {
+		if flags[i] == "--model" {
+			i++ // skip the value too
+			continue
+		}
+		if strings.HasPrefix(flags[i], "--model=") {
+			continue
+		}
+		out = append(out, flags[i])
+	}
+	return append(out, "--model", model)
 }
 
 // findTranscript locates the on-disk transcript (~/.claude/projects/<project>/
@@ -136,7 +159,7 @@ func findTranscript(js *JobState, sid string) string {
 // whenever the transcript can be located — without it a worker whose transcript
 // lives outside its cwd-derived project dir cannot find its conversation and
 // exits at startup.
-func resumeDescriptor(short string, js *JobState, dangerous bool) (map[string]any, error) {
+func resumeDescriptor(short string, js *JobState, model string, dangerous bool) (map[string]any, error) {
 	sid := js.ResumeSessionID
 	if sid == "" {
 		sid = js.SessionID
@@ -144,7 +167,7 @@ func resumeDescriptor(short string, js *JobState, dangerous bool) (map[string]an
 	if sid == "" {
 		return nil, fmt.Errorf("session %s has no sessionId on disk", short)
 	}
-	flags := resumeFlags(js, dangerous)
+	flags := resumeFlags(js, model, dangerous)
 	launch := map[string]any{
 		"mode":      "resume",
 		"sessionId": sid,
@@ -181,12 +204,12 @@ func resumeDescriptor(short string, js *JobState, dangerous bool) (map[string]an
 // reply of ok with the same short means the daemon claimed/spawned the worker;
 // the caller must still verify it reaches a usable state (a resume can crash
 // during replay, e.g. when the saved cwd is gone or there is no transcript).
-func (c *Client) DispatchResume(short string, js *JobState, dangerous bool) (string, error) {
+func (c *Client) DispatchResume(short string, js *JobState, model string, dangerous bool) (string, error) {
 	key, err := controlKey()
 	if err != nil {
 		return "", err
 	}
-	desc, err := resumeDescriptor(short, js, dangerous)
+	desc, err := resumeDescriptor(short, js, model, dangerous)
 	if err != nil {
 		return "", err
 	}
@@ -301,10 +324,12 @@ func cwdMissing(cwd string) bool {
 // dispatch op: under its own short, same sessionId, no fork and no duplicate
 // entry. It validates the saved cwd up front (a deleted worktree is the most
 // common crash and is not worth a spawn), verifies the worker comes up usable,
-// and on failure stops the worker so no crashed/idle orphan is left behind. It
-// returns ErrNoJobState when the session has no on-disk state (caller should
+// and on failure stops the worker so no crashed/idle orphan is left behind. A
+// non-empty model relaunches the worker on that model, overriding any --model
+// the session was originally started with; empty keeps the saved flags as-is.
+// It returns ErrNoJobState when the session has no on-disk state (caller should
 // fall back to ResumeByCLI).
-func (c *Client) ResumeInPlace(short string, dangerous bool) (ResumeOutcome, error) {
+func (c *Client) ResumeInPlace(short, model string, dangerous bool) (ResumeOutcome, error) {
 	js, err := ReadJobState(short)
 	if err != nil {
 		return ResumeOutcome{}, err // ErrNoJobState or a read/parse error
@@ -319,7 +344,7 @@ func (c *Client) ResumeInPlace(short string, dangerous bool) (ResumeOutcome, err
 		if attempt > 1 {
 			time.Sleep(1500 * time.Millisecond)
 		}
-		rshort, derr := c.DispatchResume(short, js, dangerous)
+		rshort, derr := c.DispatchResume(short, js, model, dangerous)
 		if derr != nil {
 			lastErr = derr // a refused dispatch (e.g. ESTALE) is worth one retry
 			continue
@@ -365,7 +390,7 @@ func (c *Client) EnsureLive(sess Session) (Session, error) {
 	if sess.Short == "" {
 		return Session{}, fmt.Errorf("session is not running and has no short id to resume by — use resume_session")
 	}
-	out, err := c.ResumeInPlace(sess.Short, false)
+	out, err := c.ResumeInPlace(sess.Short, "", false)
 	if errors.Is(err, ErrNoJobState) {
 		return Session{}, fmt.Errorf("session %s is not running and has no job state to resume in place — use resume_session (it can fork-resume by full session id)", sess.Short)
 	}
@@ -389,8 +414,8 @@ func (c *Client) EnsureLive(sess Session) (Session, error) {
 // no longer in the agents list): it runs `claude --bg --resume <sessionID>`,
 // which forks to a fresh short, verifies liveness, and removes the forked worker
 // on failure so nothing is left behind.
-func (c *Client) ResumeByCLI(sessionID string, dangerous bool) (ResumeOutcome, error) {
-	out, err := Resume(sessionID, dangerous)
+func (c *Client) ResumeByCLI(sessionID, model string, dangerous bool) (ResumeOutcome, error) {
+	out, err := Resume(sessionID, model, dangerous)
 	if err != nil {
 		return ResumeOutcome{}, err
 	}
