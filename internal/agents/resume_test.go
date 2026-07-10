@@ -13,29 +13,37 @@ func TestResumeFlags(t *testing.T) {
 	cases := []struct {
 		name      string
 		flags     []string
+		model     string
 		dangerous bool
 		want      []string
 	}{
-		{"not dangerous keeps flags", []string{"--model", "opus"}, false, []string{"--model", "opus"}},
-		{"dangerous adds bypass", []string{"--name", "x"}, true, []string{"--name", "x", "--dangerously-skip-permissions"}},
-		{"dangerous no dup when already bypass", []string{"--dangerously-skip-permissions"}, true, []string{"--dangerously-skip-permissions"}},
-		{"dangerous no dup when perm-mode set", []string{"--permission-mode", "bypassPermissions"}, true, []string{"--permission-mode", "bypassPermissions"}},
-		{"dangerous on empty", nil, true, []string{"--dangerously-skip-permissions"}},
+		{"not dangerous keeps flags", []string{"--model", "opus"}, "", false, []string{"--model", "opus"}},
+		{"dangerous adds bypass", []string{"--name", "x"}, "", true, []string{"--name", "x", "--dangerously-skip-permissions"}},
+		{"dangerous no dup when already bypass", []string{"--dangerously-skip-permissions"}, "", true, []string{"--dangerously-skip-permissions"}},
+		{"dangerous no dup when perm-mode set", []string{"--permission-mode", "bypassPermissions"}, "", true, []string{"--permission-mode", "bypassPermissions"}},
+		{"dangerous on empty", nil, "", true, []string{"--dangerously-skip-permissions"}},
+		{"model added when absent", []string{"--name", "x"}, "sonnet", false, []string{"--name", "x", "--model", "sonnet"}},
+		{"model replaces saved --model pair", []string{"--model", "opus", "--name", "x"}, "sonnet", false, []string{"--name", "x", "--model", "sonnet"}},
+		{"model replaces saved --model=value", []string{"--model=opus", "--name", "x"}, "sonnet", false, []string{"--name", "x", "--model", "sonnet"}},
+		{"model replaces every saved model flag", []string{"--model", "opus", "--model=haiku"}, "sonnet", false, []string{"--model", "sonnet"}},
+		{"model on empty flags", nil, "sonnet", false, []string{"--model", "sonnet"}},
+		{"model with dangerous", []string{"--model=opus"}, "sonnet", true, []string{"--model", "sonnet", "--dangerously-skip-permissions"}},
+		{"trailing --model without value is dropped", []string{"--name", "x", "--model"}, "sonnet", false, []string{"--name", "x", "--model", "sonnet"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := resumeFlags(&JobState{RespawnFlags: c.flags}, c.dangerous)
+			got := resumeFlags(&JobState{RespawnFlags: c.flags}, c.model, c.dangerous)
 			if !reflect.DeepEqual(got, c.want) {
-				t.Fatalf("resumeFlags(%v, %v) = %v, want %v", c.flags, c.dangerous, got, c.want)
+				t.Fatalf("resumeFlags(%v, %q, %v) = %v, want %v", c.flags, c.model, c.dangerous, got, c.want)
 			}
 		})
 	}
 }
 
 func TestResumeFlagsDoesNotMutateInput(t *testing.T) {
-	in := []string{"--name", "x"}
-	_ = resumeFlags(&JobState{RespawnFlags: in}, true)
-	if !reflect.DeepEqual(in, []string{"--name", "x"}) {
+	in := []string{"--name", "x", "--model", "opus"}
+	_ = resumeFlags(&JobState{RespawnFlags: in}, "sonnet", true)
+	if !reflect.DeepEqual(in, []string{"--name", "x", "--model", "opus"}) {
 		t.Fatalf("resumeFlags mutated its input: %v", in)
 	}
 }
@@ -128,7 +136,7 @@ func TestResumeDescriptorCarriesTranscriptPath(t *testing.T) {
 	}
 
 	js := &JobState{SessionID: sid, Cwd: home, LinkScanPath: transcript}
-	desc, err := resumeDescriptor("11111111", js, false)
+	desc, err := resumeDescriptor("11111111", js, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +153,7 @@ func TestResumeDescriptorCarriesTranscriptPath(t *testing.T) {
 
 	t.Run("omitted when no transcript exists", func(t *testing.T) {
 		js := &JobState{SessionID: "00000000-0000-0000-0000-000000000000", Cwd: home}
-		desc, err := resumeDescriptor("00000000", js, false)
+		desc, err := resumeDescriptor("00000000", js, "", false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -155,8 +163,44 @@ func TestResumeDescriptorCarriesTranscriptPath(t *testing.T) {
 		}
 	})
 	t.Run("errors without a session id", func(t *testing.T) {
-		if _, err := resumeDescriptor("shortid0", &JobState{}, false); err == nil {
+		if _, err := resumeDescriptor("shortid0", &JobState{}, "", false); err == nil {
 			t.Error("expected an error for a job state with no session id")
+		}
+	})
+}
+
+// TestResumeDescriptorModelOverride asserts an explicit model lands in BOTH
+// flag lists the daemon reads — launch.flagArgs (this spawn) and respawnFlags
+// (future respawns) — replacing the model the session was launched with, and
+// that an empty model leaves the saved flags untouched.
+func TestResumeDescriptorModelOverride(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sid := "11111111-2222-3333-4444-555555555555"
+	js := &JobState{SessionID: sid, Cwd: home, RespawnFlags: []string{"--model", "opus", "--name", "x"}}
+
+	desc, err := resumeDescriptor("11111111", js, "sonnet", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"--name", "x", "--model", "sonnet"}
+	launch := desc["launch"].(map[string]any)
+	if got := launch["flagArgs"]; !reflect.DeepEqual(got, want) {
+		t.Errorf("launch.flagArgs = %v, want %v", got, want)
+	}
+	if got := desc["respawnFlags"]; !reflect.DeepEqual(got, want) {
+		t.Errorf("respawnFlags = %v, want %v", got, want)
+	}
+
+	t.Run("empty model keeps the saved flags", func(t *testing.T) {
+		desc, err := resumeDescriptor("11111111", js, "", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		launch := desc["launch"].(map[string]any)
+		want := []string{"--model", "opus", "--name", "x"}
+		if got := launch["flagArgs"]; !reflect.DeepEqual(got, want) {
+			t.Errorf("launch.flagArgs = %v, want %v", got, want)
 		}
 	})
 }
@@ -242,7 +286,7 @@ func TestResumeInPlaceIntegration(t *testing.T) {
 		t.Skip("set RESUME_IT_SHORT=<not-running session short> to run the live resume test")
 	}
 	c := NewClient()
-	out, err := c.ResumeInPlace(short, true)
+	out, err := c.ResumeInPlace(short, "", true)
 	if err != nil {
 		t.Fatalf("ResumeInPlace(%s): %v", short, err)
 	}
@@ -299,7 +343,7 @@ func TestResumeInPlaceCwdGone(t *testing.T) {
 		t.Skip("set RESUME_IT_CWDGONE_SHORT=<session whose cwd was deleted> to run")
 	}
 	c := NewClient()
-	_, err := c.ResumeInPlace(short, true)
+	_, err := c.ResumeInPlace(short, "", true)
 	if err == nil {
 		t.Fatalf("expected a cwd-gone error for %s, got success", short)
 	}
@@ -320,7 +364,7 @@ func TestResumeInPlaceCrashCleanup(t *testing.T) {
 		t.Skip("set RESUME_IT_CRASH_SHORT=<session whose resume crashes> to run the cleanup test")
 	}
 	c := NewClient()
-	out, err := c.ResumeInPlace(short, true)
+	out, err := c.ResumeInPlace(short, "", true)
 	if err == nil {
 		// The in-place dispatch path is robust and may resume where a raw CLI
 		// resume would crash (e.g. a missing transcript). Don't leave it live, and
