@@ -390,15 +390,9 @@ func (c *Client) EnsureLive(sess Session, dialog ResumeDialogChoice) (Session, s
 	if sess.Live {
 		return sess, "", nil
 	}
-	if sess.Short == "" {
-		return Session{}, "", fmt.Errorf("session is not running and has no short id to resume by — use resume_session")
-	}
-	out, err := c.ResumeInPlace(sess.Short, "", false)
-	if errors.Is(err, ErrNoJobState) {
-		return Session{}, "", fmt.Errorf("session %s is not running and has no job state to resume in place — use resume_session (it can fork-resume by full session id)", sess.Short)
-	}
+	out, err := c.resumeAny(sess)
 	if err != nil {
-		return Session{}, "", fmt.Errorf("session %s is not running and auto-resume failed: %w", sess.Short, err)
+		return Session{}, "", err
 	}
 	if err := c.WaitInteractive(out.Short, 20*time.Second); err != nil {
 		return Session{}, "", fmt.Errorf("session %s was resumed but never settled at its prompt: %w", out.Short, err)
@@ -417,12 +411,58 @@ func (c *Client) EnsureLive(sess Session, dialog ResumeDialogChoice) (Session, s
 	return live, note, nil
 }
 
-// ResumeByCLI is the fallback for sessions with no on-disk job state (e.g. ones
-// no longer in the agents list): it runs `claude --bg --resume <sessionID>`,
-// which forks to a fresh short, verifies liveness, and removes the forked worker
-// on failure so nothing is left behind.
-func (c *Client) ResumeByCLI(sessionID, model string, dangerous bool) (ResumeOutcome, error) {
-	out, err := Resume(sessionID, model, dangerous)
+// resumeAny brings a not-running session back by whichever route its on-disk
+// state allows, so callers do not have to know which kind of session they hold:
+//
+//   - listed, with job state: resumed in place via the daemon (own short, same
+//     session id, no fork or duplicate entry);
+//   - listed but without job state, or not listed at all — an orphan found by
+//     its transcript alone: resurrected by session id through the CLI, launched
+//     in the session's own working directory and registered under its recovered
+//     name.
+func (c *Client) resumeAny(sess Session) (ResumeOutcome, error) {
+	if sess.Short != "" {
+		out, err := c.ResumeInPlace(sess.Short, "", false)
+		if !errors.Is(err, ErrNoJobState) {
+			if err != nil {
+				return ResumeOutcome{}, fmt.Errorf("session %s is not running and auto-resume failed: %w", sess.Short, err)
+			}
+			return out, nil
+		}
+	}
+	if sess.SessionID == "" {
+		return ResumeOutcome{}, fmt.Errorf("session is not running and has neither job state nor a session id to resume by")
+	}
+	out, err := c.ResumeByCLI(sess.SessionID, sess.Cwd, "", sess.Name, false)
+	if err != nil {
+		return ResumeOutcome{}, fmt.Errorf("session %s is not running and could not be resurrected from its transcript: %w", sess.SessionID, err)
+	}
+	return out, nil
+}
+
+// ResumeByCLI is the fallback for sessions with no on-disk job state — ones no
+// longer in the agents list, or never in it: it runs `claude --bg --resume
+// <sessionID>` in the session's own working directory, verifies liveness, and
+// removes the worker on failure so nothing is left behind.
+//
+// name is the display name to register for the resurrected session. Without it
+// a session resumed this way carries no name in the store: while its process
+// runs the view derives a title from the transcript so it looks fine, but once
+// it exits the entry falls back to showing the session kind ("bg") — a session
+// with hundreds of records of real history, listed as nothing. Recovering the
+// name from the transcript and registering it is what makes a resurrected
+// session indistinguishable from one this server created.
+func (c *Client) ResumeByCLI(sessionID, cwd, model, name string, dangerous bool) (ResumeOutcome, error) {
+	// A transcript is keyed to the directory its session ran in, so the missing
+	// directory is worth naming plainly. Left to the CLI it surfaces as a worker
+	// that crashes at startup and an entry to clean up by hand.
+	switch {
+	case strings.TrimSpace(cwd) == "":
+		return ResumeOutcome{}, fmt.Errorf("session %s has no recoverable working directory, and `--resume` looks a conversation up relative to the launch directory — it cannot be resumed without one", sessionID)
+	case cwdMissing(cwd):
+		return ResumeOutcome{}, fmt.Errorf("session %s cannot be resumed: its working directory no longer exists (%s) — recreate that directory (a deleted worktree is the usual cause) and resume again, or fork the session instead", sessionID, cwd)
+	}
+	out, err := Resume(sessionID, cwd, model, name, dangerous)
 	if err != nil {
 		return ResumeOutcome{}, err
 	}
@@ -432,8 +472,16 @@ func (c *Client) ResumeByCLI(sessionID, model string, dangerous bool) (ResumeOut
 	}
 	live, werr := c.WaitLive(short, 45*time.Second, 5*time.Second)
 	if werr != nil {
-		_ = Remove(short) // the forked worker is throwaway; remove it so it is not left as garbage
-		return ResumeOutcome{}, werr
+		// A resume that never came up leaves an entry behind — nameless, in a
+		// failed state, and with no transcript of its own to recover it from.
+		// Remove it rather than leaving junk to be cleaned up by hand.
+		_ = Remove(short)
+		return ResumeOutcome{}, fmt.Errorf("%w. The spawned worker %s was removed so it is not left behind as a nameless failed entry; the session's transcript on disk is untouched", werr, short)
+	}
+	if name != "" {
+		// Best-effort: the session is live and usable either way, and a missing
+		// name is not worth failing a recovered conversation over.
+		_ = c.Rename(short, sessionID, cwd, name)
 	}
 	return ResumeOutcome{Short: short, State: live.State, InPlace: false}, nil
 }

@@ -44,7 +44,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		mcp.WithDescription("Get one session's details by short id, session id (prefix) or name. For a not-running session (`live:false`), `resumable:true` means it can be continued in place with its full history (via resume_session, or automatically by submit_prompt/send_text); `resumable:false` means it is really dead."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		sess, err := a.Resolve(r.GetString("session", ""))
+		sess, err := a.ResolveAny(r.GetString("session", ""))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -83,7 +83,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("resume_session",
-		mcp.WithDescription("Bring a not-running session back to life and only return once the worker is verified live — never a job that 'already exited'. It resumes the session IN PLACE via the daemon, the same way the agents view does: under the session's own short, same session id, with no fork and no duplicate entry in the list (unlike a raw `claude --bg --resume`, which spawns a worker under a fresh short and leaves the original behind). It validates the session's saved working directory first — a deleted worktree is the most common resume crash — and returns a clear error instead of spawning a doomed worker, and on any failure it cleans up the worker it started so no crashed/idle session is left as garbage. It refuses to resume a session that is already live. Accepts a name, short id, or full session id (a full id still works for sessions no longer in the agents list, via a CLI fallback that forks to a fresh short). With model set, the session is resumed on that model (passed as `--model`, replacing any model it was originally launched with; alias or full model id — the claude CLI validates it). With prompt set, the task is delivered and submitted once the resumed session settles at its prompt (best-effort; goal=true sends it as /goal)."),
+		mcp.WithDescription("Bring a not-running session back to life and only return once the worker is verified live — never a job that 'already exited'. It resumes the session IN PLACE via the daemon, the same way the agents view does: under the session's own short, same session id, with no fork and no duplicate entry in the list (unlike a raw `claude --bg --resume`, which spawns a worker under a fresh short and leaves the original behind). It validates the session's saved working directory first — a deleted worktree is the most common resume crash — and returns a clear error instead of spawning a doomed worker, and on any failure it cleans up the worker it started so no crashed/idle session is left as garbage. It refuses to resume a session that is already live. Accepts a name, short id, or full session id. A session that has dropped off the agents list entirely (e.g. `claude rm`, which clears the list entry but never the conversation) is still found: the lookup falls back to its transcript under ~/.claude/projects, recovers its working directory and display name from the records, resumes it by session id launched in that directory, and registers the recovered name so the session does not lose its title once it exits again. Only a session with no transcript anywhere is reported as not found. If its working directory is gone the error names the directory instead of spawning a worker that crashes at startup. With model set, the session is resumed on that model (passed as `--model`, replacing any model it was originally launched with; alias or full model id — the claude CLI validates it). With prompt set, the task is delivered and submitted once the resumed session settles at its prompt (best-effort; goal=true sends it as /goal)."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("session id, short id, or name to resume")),
 		mcp.WithString("prompt", mcp.Description("task to deliver and submit once the session is ready (best-effort; optional)")),
 		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
@@ -98,31 +98,39 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		ref := r.GetString("session", "")
 		model := r.GetString("model", "")
 		dangerous := r.GetBool("dangerous", false)
-		sess, rerr := a.Resolve(ref)
-		if rerr == nil && sess.Live {
+		// ResolveAny falls back to the transcript on disk when the agents list has
+		// no entry: `claude rm` and a daemon that stopped tracking a session clear
+		// the entry but never the conversation, so an absent entry must not read
+		// as "no such session".
+		sess, rerr := a.ResolveAny(ref)
+		if rerr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("%v (no entry in the agents list and no transcript under ~/.claude/projects either)", rerr)), nil
+		}
+		if sess.Live {
 			return mcp.NewToolResultText(fmt.Sprintf("session %s is already live (state=%s); not resuming to avoid a duplicate worker — use submit_prompt to (re)seed it", sess.Short, sess.State)), nil
 		}
 
 		// Preferred path: resume in place by the session's short (daemon dispatch,
-		// no fork/duplicate). Fall back to the CLI resume only when the session has
-		// no on-disk job state (e.g. it is no longer in the agents list) or when
-		// only a full session id was given. Both paths verify liveness and clean up
-		// after themselves on failure, so no orphan is left behind.
+		// no fork/duplicate). Fall back to the CLI resume when the session has no
+		// on-disk job state — no longer in the agents list, or never in it and
+		// found only by its transcript. That path launches in the session's own
+		// working directory and registers its recovered name. Both verify liveness
+		// and clean up after themselves on failure, so nothing is left behind.
 		var out agents.ResumeOutcome
 		var err error
 		switch {
-		case rerr == nil && sess.Short != "":
+		case sess.Short != "":
 			out, err = a.ResumeInPlace(sess.Short, model, dangerous)
 			if errors.Is(err, agents.ErrNoJobState) {
-				out, err = a.ResumeByCLI(sess.SessionID, model, dangerous)
+				out, err = a.ResumeByCLI(sess.SessionID, sess.Cwd, model, sess.Name, dangerous)
 			}
-		case agents.IsFullSessionID(ref):
-			out, err = a.ResumeByCLI(ref, model, dangerous)
+		case sess.SessionID != "":
+			out, err = a.ResumeByCLI(sess.SessionID, sess.Cwd, model, sess.Name, dangerous)
 		default:
-			return mcp.NewToolResultError(rerr.Error()), nil
+			return mcp.NewToolResultError(fmt.Sprintf("no session matching %q", ref)), nil
 		}
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("resume failed: %v. The session is intact on disk — drive it from the agents view or start a fresh session", err)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("resume failed: %v. The session's transcript is intact on disk — drive it from the agents view or start a fresh session", err)), nil
 		}
 
 		short := out.Short
@@ -161,7 +169,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		if derr != nil {
 			return mcp.NewToolResultError(derr.Error()), nil
 		}
-		sess, err := a.Resolve(r.GetString("session", ""))
+		sess, err := a.ResolveAny(r.GetString("session", ""))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -194,7 +202,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("submit_prompt",
-		mcp.WithDescription("Deliver a prompt to a session and reliably submit it in one call (handles bracketed-paste for long/multi-line text, then verifies the turn actually started, retrying Enter once). Use this to (re)seed a session's task instead of send_text+send_keys. A session that is not running but resumable is transparently resumed in place first, keeping its full history — like typing into an exited session in the app — so there is no need to check liveness or call resume_session before continuing a conversation. goal=true sends it as /goal."),
+		mcp.WithDescription("Deliver a prompt to a session and reliably submit it in one call (handles bracketed-paste for long/multi-line text, then verifies the turn actually started, retrying Enter once). Use this to (re)seed a session's task instead of send_text+send_keys. A session that is not running but resumable is transparently resumed in place first, keeping its full history — like typing into an exited session in the app — so there is no need to check liveness or call resume_session before continuing a conversation. A session that is no longer in the agents list at all is still reachable by short id or session id: it is found by its transcript on disk and resurrected in its own working directory under its recovered name. goal=true sends it as /goal."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 		mcp.WithString("text", mcp.Required(), mcp.Description("prompt text to deliver and submit (may be long/multi-line)")),
 		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
@@ -204,7 +212,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		sess, err := a.Resolve(r.GetString("session", ""))
+		sess, err := a.ResolveAny(r.GetString("session", ""))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -331,7 +339,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		sess, err := a.Resolve(r.GetString("session", ""))
+		sess, err := a.ResolveAny(r.GetString("session", ""))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -375,7 +383,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		sess, err := a.Resolve(r.GetString("session", ""))
+		sess, err := a.ResolveAny(r.GetString("session", ""))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
