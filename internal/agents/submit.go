@@ -5,12 +5,20 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // errNotStarted is returned when a prompt was delivered but no turn started: the
 // text is sitting unsubmitted in the input box (typically collapsed to a
 // "[Pasted text]" bracketed paste that still needs an Enter).
 var errNotStarted = errors.New("prompt delivered but the session did not start a turn — the text is in the input box; retry submit_prompt or send Enter")
+
+// goalMaxLen is the maximum length, in characters, that Claude Code's /goal
+// command accepts for a goal condition. A longer condition is rejected with
+// "Goal condition is limited to 4000 characters (got N)" and the prompt is left
+// unsubmitted in the input box, so SubmitPrompt must not hand /goal a body over
+// this length — it falls back to a plain prompt instead (see SubmitPrompt).
+const goalMaxLen = 4000
 
 // readyMarkers are strings that appear once a freshly-booted session has
 // rendered its REPL prompt and can accept input.
@@ -61,6 +69,25 @@ func (c *Client) waitStarted(short string, base Session, timeout time.Duration) 
 	}
 }
 
+// buildSubmitBody produces the exact text to deliver for a submission. A plain
+// prompt is delivered verbatim (only trailing newlines trimmed). A goal is
+// delivered as a "/goal <condition>" command — but only when the condition fits
+// Claude Code's goalMaxLen limit; a longer condition would be rejected outright
+// ("Goal condition is limited to 4000 characters") and left unsubmitted, so it
+// falls back to the plain body, delivering the full task as an ordinary prompt.
+// The overlay is lost but the whole task reaches the agent and the turn starts.
+// Length is measured in characters (runes), matching Claude Code's own count, so
+// a multi-byte (e.g. Cyrillic) goal is not needlessly downgraded.
+func buildSubmitBody(text string, goal bool) string {
+	body := strings.TrimRight(text, "\r\n")
+	if goal {
+		if g := strings.TrimSpace(text); utf8.RuneCountInString(g) <= goalMaxLen {
+			body = "/goal " + g
+		}
+	}
+	return body
+}
+
 // SubmitPrompt delivers text to a session and submits it as a turn, then always
 // verifies the turn actually started before reporting success. It is the single
 // delivery path for both plain prompts and /goal commands (goal just prefixes
@@ -78,10 +105,7 @@ func (c *Client) waitStarted(short string, base Session, timeout time.Duration) 
 // replies) it falls back to the keystroke-emulation path, submitViaPTY, which
 // carries the same verify+retry guarantee.
 func (c *Client) SubmitPrompt(short, text string, goal bool) (string, error) {
-	body := strings.TrimRight(text, "\r\n")
-	if goal {
-		body = "/goal " + strings.TrimSpace(text)
-	}
+	body := buildSubmitBody(text, goal)
 	if strings.TrimSpace(body) == "" {
 		return "", fmt.Errorf("empty prompt")
 	}
