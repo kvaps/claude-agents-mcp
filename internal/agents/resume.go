@@ -135,11 +135,7 @@ func findTranscript(js *JobState, sid string) string {
 			return p
 		}
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	matches, _ := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", sid+".jsonl"))
+	matches := transcriptFiles(sid)
 	if len(matches) == 0 {
 		return ""
 	}
@@ -383,22 +379,33 @@ func Resumable(short string) bool {
 // returned as-is. The resumed session is additionally waited to its REPL prompt
 // so a follow-up submit/keystroke lands in a ready input box, not a booting
 // screen.
-func (c *Client) EnsureLive(sess Session) (Session, error) {
+//
+// A resume can come up on the CLI's resume-return dialog instead of at the
+// prompt, and that dialog owns the keyboard: anything typed next answers it
+// rather than reaching the input box. So the dialog is settled here, per the
+// caller's choice, before the session is handed back as ready — see
+// SettleResumeDialog. The returned note describes what was done to it, for the
+// tool result.
+func (c *Client) EnsureLive(sess Session, dialog ResumeDialogChoice) (Session, string, error) {
 	if sess.Live {
-		return sess, nil
+		return sess, "", nil
 	}
 	if sess.Short == "" {
-		return Session{}, fmt.Errorf("session is not running and has no short id to resume by — use resume_session")
+		return Session{}, "", fmt.Errorf("session is not running and has no short id to resume by — use resume_session")
 	}
 	out, err := c.ResumeInPlace(sess.Short, "", false)
 	if errors.Is(err, ErrNoJobState) {
-		return Session{}, fmt.Errorf("session %s is not running and has no job state to resume in place — use resume_session (it can fork-resume by full session id)", sess.Short)
+		return Session{}, "", fmt.Errorf("session %s is not running and has no job state to resume in place — use resume_session (it can fork-resume by full session id)", sess.Short)
 	}
 	if err != nil {
-		return Session{}, fmt.Errorf("session %s is not running and auto-resume failed: %w", sess.Short, err)
+		return Session{}, "", fmt.Errorf("session %s is not running and auto-resume failed: %w", sess.Short, err)
 	}
-	if err := c.WaitReady(out.Short, 20*time.Second); err != nil {
-		return Session{}, fmt.Errorf("session %s was resumed but never settled at its prompt: %w", out.Short, err)
+	if err := c.WaitInteractive(out.Short, 20*time.Second); err != nil {
+		return Session{}, "", fmt.Errorf("session %s was resumed but never settled at its prompt: %w", out.Short, err)
+	}
+	note, derr := c.SettleResumeDialog(out.Short, dialog)
+	if derr != nil {
+		return Session{}, "", fmt.Errorf("session %s was resumed but %w", out.Short, derr)
 	}
 	live, rerr := c.Resolve(out.Short)
 	if rerr != nil || !live.Live {
@@ -407,7 +414,7 @@ func (c *Client) EnsureLive(sess Session) (Session, error) {
 		live = sess
 		live.Live, live.State = true, out.State
 	}
-	return live, nil
+	return live, note, nil
 }
 
 // ResumeByCLI is the fallback for sessions with no on-disk job state (e.g. ones

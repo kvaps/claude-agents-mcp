@@ -33,9 +33,9 @@ Session management:
 - `list_sessions` — every session the agents view shows, **including not-running ones** (`live:false`); running ones carry live state (`state`, `tempo`, `detail`, `needs`), short id, `cwd`, `name`, and a `pinned` flag. Not-running ones carry a `resumable` flag distinguishing **exited-but-resumable** (can be continued in place with full history — prefer that over forking or starting fresh) from **really dead** (no job state, or its working directory is gone). `live_only=true` filters to running sessions
 - `get_session` — one session by short id / session id / name (same `resumable` flag as `list_sessions`)
 - `create_session` — `claude --bg` in a directory (optional name, dangerous mode); optional `model` runs the session on a specific model (passed as `--model`: an alias like `sonnet`/`opus`/`haiku` or a full model id — the claude CLI validates it); with `prompt` it delivers and reliably submits the task so the agent starts immediately (`goal=true` sends it as `/goal`)
-- `submit_prompt` — deliver a prompt to a session and reliably submit it in one call (handles long/multi-line bracketed-paste, verifies the turn started, retries Enter once); a not-running-but-resumable session is transparently resumed in place first, like typing into an exited session in the app; `goal=true` sends `/goal`
-- `resume_session` — bring a not-running session back to life **in place** (the same way the agents view does it) and **return only once the worker is verified live**, so you never attach to a job that "already exited". It resumes under the session's own short with the same session id — no fork, no duplicate entry — unlike a raw `claude --bg --resume`, which spawns a worker under a fresh short and leaves the original behind. It validates the saved working directory first (a deleted worktree is the most common resume crash) and cleans up the worker it started on any failure, so nothing is left as garbage. Refuses to resume an already-live session. Accepts a name, short id, or full session id (a full id still works for sessions no longer in the agents list, via a CLI fallback that forks to a fresh short); optional `model` resumes the session on a different model, **replacing** any `--model` it was originally launched with (omit to keep it); optional `prompt` is delivered once it settles (`goal=true` sends `/goal`)
-- `fork_session` — fork a session into a **new, independent** background session that carries **all of the source's history up to the moment of the fork**. The fork shows up in the agents view as its own entry (new short, new session id) and can be driven immediately; the source is never touched. It uses Claude Code's native `--fork-session` (`claude --bg --resume <id> --fork-session`), so the whole transcript is forked correctly — not a shallow copy — and the fork inherits the source's working directory. Accepts a name, short id, or session id for the source; optional `name` for the fork; optional `model` runs the fork on a specific model, independent of the source's; optional `prompt` is delivered once it settles (`goal=true` sends `/goal`)
+- `submit_prompt` — deliver a prompt to a session and reliably submit it in one call (handles long/multi-line bracketed-paste, then confirms the prompt actually landed — against the session transcript where possible — and retries Enter once); a not-running-but-resumable session is transparently resumed in place first, like typing into an exited session in the app; `goal=true` sends `/goal`. `on_resume_dialog` (`keep` (default) / `compact` / `ask`) decides what to do if the resumed session comes up on the CLI's resume dialog — see [The resume dialog](#the-resume-dialog)
+- `resume_session` — bring a not-running session back to life **in place** (the same way the agents view does it) and **return only once the worker is verified live**, so you never attach to a job that "already exited". It resumes under the session's own short with the same session id — no fork, no duplicate entry — unlike a raw `claude --bg --resume`, which spawns a worker under a fresh short and leaves the original behind. It validates the saved working directory first (a deleted worktree is the most common resume crash) and cleans up the worker it started on any failure, so nothing is left as garbage. Refuses to resume an already-live session. Accepts a name, short id, or full session id (a full id still works for sessions no longer in the agents list, via a CLI fallback that forks to a fresh short); optional `model` resumes the session on a different model, **replacing** any `--model` it was originally launched with (omit to keep it); optional `prompt` is delivered once it settles (`goal=true` sends `/goal`); `on_resume_dialog` decides how the CLI's resume dialog is answered — see [The resume dialog](#the-resume-dialog)
+- `fork_session` — fork a session into a **new, independent** background session that carries **all of the source's history up to the moment of the fork**. The fork shows up in the agents view as its own entry (new short, new session id) and can be driven immediately; the source is never touched. It uses Claude Code's native `--fork-session` (`claude --bg --resume <id> --fork-session`), so the whole transcript is forked correctly — not a shallow copy — and the fork inherits the source's working directory. Accepts a name, short id, or session id for the source; optional `name` for the fork; optional `model` runs the fork on a specific model, independent of the source's; optional `prompt` is delivered once it settles (`goal=true` sends `/goal`); `on_resume_dialog` decides how the CLI's resume dialog is answered — a fork replays the source's history, so it can hit the same dialog
 - `rename_session` — set a session's custom title (`ctrl+r` in the agents view)
 - `pin_session` — pin / unpin a session so it sorts to the top (`ctrl+t` in the agents view)
 - `reorder_session` — move a running session up/down or to an absolute slot (`shift+↑/↓` in the agents view)
@@ -44,10 +44,51 @@ Session management:
 Attach — everything a human can do inside a session:
 
 - `read_screen` — current screen as plain text
-- `send_text` — type text into a session (fire-and-forget by default; `wait=true` blocks and returns the settled screen); auto-resumes a not-running-but-resumable session in place first
-- `send_keys` — named keys (fire-and-forget; `wait=true` to block): `enter esc tab space backspace delete up down left right home end pageup pagedown ctrl-c ctrl-d ctrl-u ctrl-l ctrl-z ctrl-r`
-- `send_command` — run a slash command reliably (clears modals → waits for idle → types → submits): `/remote-control`, `/goal`, `/compact`, …; auto-resumes a not-running-but-resumable session in place first
+- `send_text` — type text into a session (fire-and-forget by default; `wait=true` blocks and returns the settled screen); auto-resumes a not-running-but-resumable session in place first, honouring `on_resume_dialog`
+- `send_keys` — named keys (fire-and-forget; `wait=true` to block): `enter esc tab space backspace delete up down left right home end pageup pagedown ctrl-c ctrl-d ctrl-u ctrl-l ctrl-z ctrl-r`. **`enter` is a confirmation keystroke, not a neutral one** — whatever holds focus consumes it. Never send it to recover a delivery without reading the screen first; see [The resume dialog](#the-resume-dialog)
+- `send_command` — run a slash command reliably (clears modals → waits for idle → types → submits): `/remote-control`, `/goal`, `/compact`, …; auto-resumes a not-running-but-resumable session in place first, honouring `on_resume_dialog`
 - `cancel` — interrupt the current task (Esc, or Ctrl-C with `hard=true`)
+
+## The resume dialog
+
+When a session that is old enough and large enough is resumed, the Claude Code CLI opens a startup dialog before handing the keyboard to the REPL:
+
+```
+This session is 2h 15m old and 187k tokens.
+
+Resuming the full session will consume a substantial portion of your usage
+limits. We recommend resuming from a summary.
+
+❯ Resume from summary (recommended)
+  Resume full session as-is
+  Don't ask me again
+```
+
+Two things about it matter to anything driving a session programmatically:
+
+- **The preselected option compacts the conversation.** Choosing it submits `/compact`; the session's detail is replaced by a summary, and any prompt sitting unsubmitted in the input box is discarded with it.
+- **The dialog owns the keyboard.** Text delivered while it is up does not reach the input box, and an `Enter` aimed at the input box answers the dialog instead — with the preselected option.
+
+So the tools never send a bare `Enter` to rescue a delivery without first reading the screen, and they never tell you to. Instead:
+
+- After a resume, the screen is inspected. The dialog is matched by its own option labels; anything else that looks like a choice dialog is reported as `unknown` and left strictly alone, because answering a question you have not identified is worse than not answering it.
+- `on_resume_dialog` decides what happens: **`keep` (the default)** navigates to *Resume full session as-is* and confirms it, keeping the conversation; `compact` accepts the summary; `ask` leaves the dialog up and returns its kind and options so the caller can choose. **Compaction is opt-in** — delivering a prompt should never spend a session's context as a side effect.
+- Answering is verified, not fired blind: the selection is moved with arrow keys and the screen re-read until the intended option is the highlighted one, and only then is `Enter` sent. If the selection cannot be put where it belongs, nothing is confirmed and the dialog is reported instead.
+- When a delivery is blocked, the error names the dialog and its options rather than saying "the turn did not start".
+
+The CLI gates the dialog on roughly 70 minutes since the last message and ~100k estimated tokens (`CLAUDE_CODE_RESUME_THRESHOLD_MINUTES` / `CLAUDE_CODE_RESUME_TOKEN_THRESHOLD` override the thresholds), so it is a long-running-fleet problem specifically: exactly the sessions with the most context to lose.
+
+## What "the turn started" means
+
+`submit_prompt` confirms a delivery against the session transcript where it can: the prompt appearing as a user record in `~/.claude/projects/<project>/<sessionId>.jsonl` is the only evidence that the text reached the conversation. The daemon roster heuristics remain as a fallback for sessions whose transcript cannot be located, and the tool result says which of the two confirmed it.
+
+A prompt that has not (yet) started a turn is reported as one of three distinct states, because the right response differs in each:
+
+| state | what happened | what to do |
+| --- | --- | --- |
+| blocked on a dialog | a dialog has focus; the prompt never reached the input box | answer the dialog — `on_resume_dialog`, or explicitly |
+| queued | the session was already running a turn; the prompt is in the input box and the REPL will consume it when that turn ends | nothing. Do not retry (it would deliver twice) and do not send `Enter` |
+| stuck | no dialog, no running turn, text unsubmitted in the box | `Enter` is the right recovery — and has already been retried twice by the time this is reported |
 
 ## Status
 
@@ -56,7 +97,9 @@ Attach — everything a human can do inside a session:
 - [x] List sessions, including not-running ones (`--all`), with a `live` flag and live state (`state`/`tempo`/`detail`/`needs`/`cwd`/`name`)
 - [x] Get a single session
 - [x] Create a session (`claude --bg`), optionally delivering + submitting a starting prompt (or `/goal`)
-- [x] Reliably deliver + submit a prompt (`submit_prompt`): bracketed-paste for long/multi-line, verify the turn started
+- [x] Reliably deliver + submit a prompt (`submit_prompt`): bracketed-paste for long/multi-line, verify the prompt landed against the session transcript
+- [x] Handle the CLI's resume dialog (`on_resume_dialog`: `keep` (default) / `compact` / `ask`) instead of answering it with a blind `Enter` that compacts the conversation and discards the prompt
+- [x] Distinguish blocked-on-a-dialog / queued-behind-a-running-turn / genuinely-stuck instead of reporting all three as "the turn did not start"
 - [x] Resume a not-running session (`resume_session`): in-place daemon dispatch (own short, same session id, no fork/duplicate), validate the saved cwd first, pass the transcript path so the worker finds its conversation regardless of cwd, verify liveness before returning, clean up the worker on any failure
 - [x] Auto-resume on input: `submit_prompt` / `send_text` / `send_command` into an exited-but-resumable session transparently resume it in place first (like typing into an exited session in the app)
 - [x] `resumable` flag on not-running sessions (`list_sessions` / `get_session`): exited-but-resumable vs really dead, so an orchestrator continues instead of forking
@@ -77,7 +120,7 @@ Attach — everything a human can do inside a session:
 
 - [ ] Full VT terminal emulation for `read_screen` (today it ANSI-strips the PTY tail, so wrapped/redrawn TUI screens render imperfectly — not a true cell grid)
 - [ ] Live streaming / subscribe tool (push updates as a session changes; today `read_screen` is a pull/snapshot)
-- [ ] Structured detection of permission prompts + a high-level "answer the prompt" tool
+- [ ] Structured detection of permission prompts + a high-level "answer the prompt" tool (the resume dialog is recognised and answerable today; permission prompts are only reported as an unknown dialog)
 - [ ] High-level "answer the session's `needs` question" tool
 - [ ] Real-time bidirectional interactive bridge (hand a live session to a human/agent)
 - [ ] Rename reflected in the live daemon roster `name` (today it sets the custom title; the roster name stays the spawn name)

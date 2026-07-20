@@ -253,9 +253,12 @@ func TestEnsureLiveIntegration(t *testing.T) {
 	if sess.Live {
 		t.Fatalf("fixture %s is already live; stop it first", short)
 	}
-	live, err := c.EnsureLive(sess)
+	live, note, err := c.EnsureLive(sess, DialogKeep)
 	if err != nil {
 		t.Fatalf("EnsureLive(%s): %v", short, err)
+	}
+	if note != "" {
+		t.Logf("EnsureLive(%s): %s", short, note)
 	}
 	t.Cleanup(func() { _ = Stop(live.Short) })
 	if !live.Live {

@@ -75,10 +75,11 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		if err := a.WaitReady(short, 20*time.Second); err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("created %s but it never became ready; prompt NOT delivered: %v", short, err)), nil
 		}
-		if _, err := a.SubmitPrompt(short, prompt, r.GetBool("goal", false)); err != nil {
+		how, err := a.SubmitPrompt(short, prompt, r.GetBool("goal", false))
+		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("created %s but %v", short, err)), nil
 		}
-		return mcp.NewToolResultText(fmt.Sprintf("created %s and started the task", short)), nil
+		return mcp.NewToolResultText(fmt.Sprintf("created %s and started the task — %s", short, how)), nil
 	})
 
 	s.AddTool(mcp.NewTool("resume_session",
@@ -88,7 +89,12 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
 		mcp.WithString("model", mcp.Description("model to resume on: an alias (sonnet, opus, haiku) or a full model id; overrides the session's original model, omit to keep it")),
 		mcp.WithBoolean("dangerous", mcp.Description("pass --dangerously-skip-permissions")),
+		mcp.WithString("on_resume_dialog", mcp.Description(onResumeDialogDesc)),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		dialog, derr := resumeDialogChoice(r)
+		if derr != nil {
+			return mcp.NewToolResultError(derr.Error()), nil
+		}
 		ref := r.GetString("session", "")
 		model := r.GetString("model", "")
 		dangerous := r.GetBool("dangerous", false)
@@ -120,17 +126,25 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		}
 
 		short := out.Short
+		if err := a.WaitInteractive(short, 20*time.Second); err != nil {
+			return mcp.NewToolResultText(fmt.Sprintf("resumed %s (live, state=%s) but it never settled at a prompt — read_screen and drive it manually", short, out.State)), nil
+		}
+		// Settle the CLI's resume dialog before anything else: while it is up it
+		// owns the keyboard, so a prompt typed underneath it goes nowhere and a
+		// stray Enter answers it with the preselected (compacting) option.
+		dnote, err := a.SettleResumeDialog(short, dialog)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("resumed %s (live, state=%s) but %v", short, out.State, err)), nil
+		}
 		prompt := r.GetString("prompt", "")
 		if strings.TrimSpace(prompt) == "" {
-			return mcp.NewToolResultText(fmt.Sprintf("resumed %s (live, state=%s)", short, out.State)), nil
+			return mcp.NewToolResultText(fmt.Sprintf("resumed %s (live, state=%s); %s", short, out.State, dnote)), nil
 		}
-		if err := a.WaitReady(short, 20*time.Second); err != nil {
-			return mcp.NewToolResultText(fmt.Sprintf("resumed %s (live, state=%s) but it never settled at a prompt; task NOT delivered — read_screen and drive it manually", short, out.State)), nil
+		how, err := a.SubmitPrompt(short, prompt, r.GetBool("goal", false))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("resumed %s; %sbut %v", short, dnote, err)), nil
 		}
-		if _, err := a.SubmitPrompt(short, prompt, r.GetBool("goal", false)); err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("resumed %s but %v", short, err)), nil
-		}
-		return mcp.NewToolResultText(fmt.Sprintf("resumed %s and started the task", short)), nil
+		return mcp.NewToolResultText(fmt.Sprintf("resumed %s; %sstarted the task — %s", short, dnote, how)), nil
 	})
 
 	s.AddTool(mcp.NewTool("fork_session",
@@ -141,7 +155,12 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		mcp.WithString("prompt", mcp.Description("task to deliver and submit once the fork is ready (best-effort; optional)")),
 		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
 		mcp.WithBoolean("dangerous", mcp.Description("pass --dangerously-skip-permissions")),
+		mcp.WithString("on_resume_dialog", mcp.Description(onResumeDialogDesc)),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		dialog, derr := resumeDialogChoice(r)
+		if derr != nil {
+			return mcp.NewToolResultError(derr.Error()), nil
+		}
 		sess, err := a.Resolve(r.GetString("session", ""))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -154,17 +173,24 @@ func New(version string, a *agents.Client) *server.MCPServer {
 			return mcp.NewToolResultError(fmt.Sprintf("fork failed: %v. The source session %s is intact", err, sess.Short)), nil
 		}
 		short := out.Short
-		prompt := r.GetString("prompt", "")
-		if strings.TrimSpace(prompt) == "" {
-			return mcp.NewToolResultText(fmt.Sprintf("forked %s -> %s (live, state=%s, session id %s); carries the source's full history", sess.Short, short, out.State, out.SessionID)), nil
+		if err := a.WaitInteractive(short, 20*time.Second); err != nil {
+			return mcp.NewToolResultText(fmt.Sprintf("forked %s -> %s (live, state=%s) but it never settled at a prompt — read_screen and drive it manually", sess.Short, short, out.State)), nil
 		}
-		if err := a.WaitReady(short, 20*time.Second); err != nil {
-			return mcp.NewToolResultText(fmt.Sprintf("forked %s -> %s (live, state=%s) but it never settled at a prompt; task NOT delivered — read_screen and drive it manually", sess.Short, short, out.State)), nil
-		}
-		if _, err := a.SubmitPrompt(short, prompt, r.GetBool("goal", false)); err != nil {
+		// A fork replays the source's history, so it can come up on the same
+		// resume dialog a plain resume does.
+		dnote, err := a.SettleResumeDialog(short, dialog)
+		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("forked %s -> %s but %v", sess.Short, short, err)), nil
 		}
-		return mcp.NewToolResultText(fmt.Sprintf("forked %s -> %s and started the task", sess.Short, short)), nil
+		prompt := r.GetString("prompt", "")
+		if strings.TrimSpace(prompt) == "" {
+			return mcp.NewToolResultText(fmt.Sprintf("forked %s -> %s (live, state=%s, session id %s); carries the source's full history; %s", sess.Short, short, out.State, out.SessionID, dnote)), nil
+		}
+		how, err := a.SubmitPrompt(short, prompt, r.GetBool("goal", false))
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("forked %s -> %s; %sbut %v", sess.Short, short, dnote, err)), nil
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("forked %s -> %s; %sstarted the task — %s", sess.Short, short, dnote, how)), nil
 	})
 
 	s.AddTool(mcp.NewTool("submit_prompt",
@@ -172,19 +198,25 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 		mcp.WithString("text", mcp.Required(), mcp.Description("prompt text to deliver and submit (may be long/multi-line)")),
 		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
+		mcp.WithString("on_resume_dialog", mcp.Description(onResumeDialogDesc)),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		dialog, err := resumeDialogChoice(r)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		sess, err := a.Resolve(r.GetString("session", ""))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		sess, note, err := ensureLive(a, sess)
+		sess, note, err := ensureLive(a, sess, dialog)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		if _, err := a.SubmitPrompt(sess.Short, r.GetString("text", ""), r.GetBool("goal", false)); err != nil {
+		how, err := a.SubmitPrompt(sess.Short, r.GetString("text", ""), r.GetBool("goal", false))
+		if err != nil {
 			return mcp.NewToolResultError(note + err.Error()), nil
 		}
-		return mcp.NewToolResultText(note + "submitted to " + sess.Short + "; turn started"), nil
+		return mcp.NewToolResultText(fmt.Sprintf("%ssubmitted to %s; %s", note, sess.Short, how)), nil
 	})
 
 	s.AddTool(mcp.NewTool("rename_session",
@@ -293,12 +325,17 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		mcp.WithString("text", mcp.Required(), mcp.Description("text to type")),
 		mcp.WithBoolean("submit", mcp.Description("press Enter after typing (default true)")),
 		mcp.WithBoolean("wait", mcp.Description("block and return the resulting screen (default false: return immediately)")),
+		mcp.WithString("on_resume_dialog", mcp.Description(onResumeDialogDesc)),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		dialog, err := resumeDialogChoice(r)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		sess, err := a.Resolve(r.GetString("session", ""))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		sess, note, err := ensureLive(a, sess)
+		sess, note, err := ensureLive(a, sess, dialog)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -332,12 +369,17 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		mcp.WithDescription("Run a slash command in a session reliably: clears modals, waits for idle, types and submits. e.g. /remote-control, /goal, /compact, /clear. A session that is not running but resumable is transparently resumed in place first (full history kept)."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 		mcp.WithString("command", mcp.Required(), mcp.Description("slash command, with or without the leading /")),
+		mcp.WithString("on_resume_dialog", mcp.Description(onResumeDialogDesc)),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		dialog, err := resumeDialogChoice(r)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		sess, err := a.Resolve(r.GetString("session", ""))
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		sess, note, err := ensureLive(a, sess)
+		sess, note, err := ensureLive(a, sess, dialog)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -367,20 +409,37 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	return s
 }
 
+// onResumeDialogDesc documents the on_resume_dialog parameter, shared by every
+// tool that can trigger a resume.
+const onResumeDialogDesc = "what to do if the resumed session comes up on the CLI's resume dialog (\"Resume from summary\" / \"Resume full session as-is\"), which the CLI shows for a session that is old and large enough and which preselects the summary option: " +
+	"\"keep\" (default) answers \"Resume full session as-is\", keeping the full conversation; " +
+	"\"compact\" accepts the summary, which discards the conversation's detail; " +
+	"\"ask\" leaves the dialog up and reports its options so you can decide. " +
+	"Never answer this dialog by sending a bare Enter — Enter takes the preselected option, which compacts the session and discards whatever prompt was pending"
+
+// resumeDialogChoice reads the on_resume_dialog parameter. Absent or empty means
+// keep: delivering a prompt must never spend a session's context as a side
+// effect, so compaction is opt-in.
+func resumeDialogChoice(r mcp.CallToolRequest) (agents.ResumeDialogChoice, error) {
+	return agents.ParseResumeDialogChoice(r.GetString("on_resume_dialog", ""))
+}
+
 // ensureLive brings a delivery target live before input is sent to it: a live
 // session is returned as-is; a not-running-but-resumable one is transparently
 // resumed in place (mirroring the app, where typing into an exited session
-// brings it back with its history). The returned note, prepended to the tool
-// result, tells the caller a resume happened.
-func ensureLive(a *agents.Client, sess agents.Session) (agents.Session, string, error) {
+// brings it back with its history), and any resume dialog it comes up on is
+// settled per the caller's choice before anything is typed. The returned note,
+// prepended to the tool result, tells the caller a resume happened and what was
+// done about the dialog.
+func ensureLive(a *agents.Client, sess agents.Session, dialog agents.ResumeDialogChoice) (agents.Session, string, error) {
 	if sess.Live {
 		return sess, "", nil
 	}
-	live, err := a.EnsureLive(sess)
+	live, dnote, err := a.EnsureLive(sess, dialog)
 	if err != nil {
 		return agents.Session{}, "", err
 	}
-	return live, fmt.Sprintf("session %s was not running — auto-resumed in place; ", live.Short), nil
+	return live, fmt.Sprintf("session %s was not running — auto-resumed in place; %s", live.Short, dnote), nil
 }
 
 func jsonResult(v any) (*mcp.CallToolResult, error) {
