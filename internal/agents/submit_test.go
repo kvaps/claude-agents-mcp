@@ -57,19 +57,20 @@ func TestSubmitPromptStartsTurnIntegration(t *testing.T) {
 	for _, tc := range cases {
 		for i := 0; i < itersPerCase; i++ {
 			settleIdle(t, c, short)
-			base, _ := c.Resolve(short)
-			if _, err := c.SubmitPrompt(short, longMultilinePrompt, tc.goal); err != nil {
+			d := c.beginDelivery(short, longMultilinePrompt)
+			how, err := c.SubmitPrompt(short, longMultilinePrompt, tc.goal)
+			if err != nil {
 				t.Errorf("%s iter %d: SubmitPrompt failed: %v", tc.name, i, err)
 				continue
 			}
-			// Verify the turn actually started, independent of which path
+			// Verify the prompt actually landed, independent of which path
 			// SubmitPrompt took (native op:reply or the PTY fallback), so the
 			// guarantee holds either way.
-			if !c.waitStarted(short, base, 8*time.Second) {
-				t.Errorf("%s iter %d: SubmitPrompt returned ok but no turn started", tc.name, i)
+			if c.waitDelivered(short, d, 8*time.Second) == "" {
+				t.Errorf("%s iter %d: SubmitPrompt reported %q but the prompt never landed", tc.name, i, how)
 				continue
 			}
-			t.Logf("%s iter %d: turn started", tc.name, i)
+			t.Logf("%s iter %d: %s", tc.name, i, how)
 		}
 	}
 }

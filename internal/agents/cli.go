@@ -120,22 +120,38 @@ func Create(cwd, name, model string, dangerous bool) (string, error) {
 // live spawns a second worker the daemon then retires (it keeps one worker per
 // session), so the returned short can be dead on arrival — callers must verify
 // liveness first (resume_session checks the roster and waits via WaitLive).
-func Resume(sessionID, model string, dangerous bool) (string, error) {
+//
+// cwd is where the worker is launched. It matters: `--resume <id>` looks the
+// conversation up in the project directory derived from the launch directory,
+// so resuming from the wrong one fails to find a transcript that is sitting
+// right there on disk. An empty cwd keeps the caller's own directory, which is
+// only right when the session belongs to it.
+func Resume(sessionID, cwd, model, name string, dangerous bool) (string, error) {
 	if strings.TrimSpace(sessionID) == "" {
 		return "", fmt.Errorf("session id is required")
+	}
+	if cwd != "" {
+		if fi, err := os.Stat(cwd); err != nil || !fi.IsDir() {
+			return "", fmt.Errorf("the session's working directory no longer exists (%s) — recreate it (e.g. the deleted worktree) and resume again, or fork the session into a directory that does exist", cwd)
+		}
 	}
 	bin, err := claudePath()
 	if err != nil {
 		return "", err
 	}
 	args := []string{"--bg", "--resume", sessionID}
+	if name != "" {
+		args = append(args, "--name", name)
+	}
 	if model != "" {
 		args = append(args, "--model", model)
 	}
 	if dangerous {
 		args = append(args, "--dangerously-skip-permissions")
 	}
-	out, err := exec.Command(bin, args...).CombinedOutput()
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = cwd
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("claude --bg --resume failed: %w: %s", err, strings.TrimSpace(string(out)))
 	}
