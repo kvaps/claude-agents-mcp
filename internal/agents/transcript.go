@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"os"
@@ -99,12 +100,29 @@ func promptFragment(body string) string {
 
 // jsonNeedle renders a fragment the way it appears inside a transcript record —
 // JSON-escaped, without the surrounding quotes — so a raw line scan can find it.
+//
+// The transcript is written by the CLI's JavaScript (JSON.stringify), which
+// leaves <, > and & as literal characters. Go's json.Marshal instead escapes
+// them to < / > / & by default, so a marshalled needle would never
+// match a prompt whose distinctive line contains them — shell redirects (`>`,
+// `&&`), JSX/HTML (`<Component>`) and the like, a common enough class of prompts
+// that the transcript check would silently fall back to the weaker roster
+// heuristic exactly there. Encoding with HTML escaping off matches what the CLI
+// actually wrote.
 func jsonNeedle(fragment string) string {
-	b, err := json.Marshal(fragment)
-	if err != nil || len(b) < 2 {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(fragment); err != nil {
 		return ""
 	}
-	return string(b[1 : len(b)-1])
+	// Encode quotes the string and appends a newline; drop the newline and the
+	// surrounding quotes, leaving the escaped body as a record carries it.
+	s := strings.TrimRight(buf.String(), "\n")
+	if len(s) < 2 {
+		return ""
+	}
+	return s[1 : len(s)-1]
 }
 
 // landedIn reports whether a chunk of transcript records contains the prompt as

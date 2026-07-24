@@ -130,6 +130,33 @@ func TestTranscriptMarkWithoutSessionID(t *testing.T) {
 	}
 }
 
+// The CLI writes transcripts with JavaScript's JSON.stringify, which leaves <,
+// > and & literal. A prompt whose distinctive line carries them — shell
+// redirects, JSX, boolean &&  — must still be found; the needle must not be
+// HTML-escaped the way Go's json.Marshal does by default.
+func TestTranscriptMatchesHTMLishPrompt(t *testing.T) {
+	sid, path := fakeSession(t)
+	prompt := "Refactor <Component> so a && b > c holds and pipe out > result.log"
+
+	m := markTranscript(sid)
+	// Mimic Node exactly: <, > and & appear literally in the record.
+	appendLine(t, path, `{"type":"user","message":{"role":"user","content":"`+prompt+`"}}`)
+	if !m.Landed(prompt) {
+		t.Error("a prompt containing <, > or & was not matched — the needle must not HTML-escape")
+	}
+}
+
+func TestJSONNeedleDoesNotHTMLEscape(t *testing.T) {
+	got := jsonNeedle("a < b && c > d")
+	if got != "a < b && c > d" {
+		t.Errorf("jsonNeedle = %q, want the fragment verbatim (no HTML escaping)", got)
+	}
+	// A control character still has to be escaped the way any JSON writer would.
+	if tab := jsonNeedle("a\tb"); tab != `a\tb` {
+		t.Errorf("jsonNeedle(tab) = %q, want %q", tab, `a\tb`)
+	}
+}
+
 func TestPromptFragment(t *testing.T) {
 	if got := promptFragment("short\nthe longest line here\nmid"); got != "the longest line here" {
 		t.Errorf("promptFragment picked %q", got)
