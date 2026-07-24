@@ -77,11 +77,18 @@ var optionRe = regexp.MustCompile(`^\s*([❯>›→*]?)\s*(\d{1,2})[.)]\s+(\S.*?
 //
 // Two passes, in order of confidence. First the resume-return dialog is looked
 // for by its own option labels — that one is recognised, so it may be answered
-// automatically, and identifying it must not rest on guesswork. Failing that,
-// any run of consecutively numbered option lines is reported as an unknown
-// dialog: enough to know that something owns the keyboard and a keystroke aimed
-// at the input box would go to it instead, without pretending to know what
-// answering it would do.
+// automatically, and identifying it must not rest on guesswork. Failing that, a
+// run of consecutively numbered option lines *drawn inside a box* is reported as
+// an unknown dialog: enough to know that something owns the keyboard and a
+// keystroke aimed at the input box would go to it instead, without pretending to
+// know what answering it would do.
+//
+// The box requirement is what keeps this from firing on ordinary output: a
+// session constantly prints bare numbered lists ("1. Do X\n2. Do Y"), and one of
+// those sitting on screen right after a resume must not be mistaken for a dialog
+// — that would wedge every resume/fork/auto-resume behind a DialogBlockedError
+// no on_resume_dialog choice can clear. A real CLI choice dialog is always
+// framed (each row wrapped in box borders); printed lists are not.
 //
 // nil means no dialog, which is the normal case for a session at its prompt.
 func DetectDialog(screen string) *Dialog {
@@ -170,19 +177,26 @@ func selectionMarked(line string) bool {
 }
 
 // detectNumbered looks for a run of consecutively numbered option lines starting
-// at 1 — the shape a numbered select dialog renders. It is the generic guard:
-// what it finds is reported, never answered.
+// at 1 and framed inside a box — the shape a numbered select dialog renders. It
+// is the generic guard: what it finds is reported, never answered.
+//
+// Option lines are matched after their box border and padding are trimmed, so a
+// framed "│ ❯ 1. Yes │" row matches, and the block is only accepted when it is
+// actually framed. That box requirement is the whole point: without it a bare
+// printed list ("1. …\n2. …") reads as a blocking dialog, and since bare rows
+// carry no leading border the old raw-line match caught *only* those — false
+// positives — while missing every real (framed) dialog.
 func detectNumbered(screen string) *Dialog {
 	lines := strings.Split(screen, "\n")
 	// Scan from the bottom: a dialog is on the current screen, while an old one
 	// may still be sitting in scrollback above it.
 	for start := len(lines) - 1; start >= 0; start-- {
-		m := optionRe.FindStringSubmatch(lines[start])
+		m := optionRe.FindStringSubmatch(trimBox(lines[start]))
 		if m == nil || m[2] != "1" {
 			continue
 		}
-		opts := collectOptions(lines[start:])
-		if len(opts) < 2 {
+		opts, boxed := collectOptions(lines[start:])
+		if len(opts) < 2 || !boxed {
 			continue
 		}
 		d := &Dialog{Title: dialogTitle(lines[:start]), Options: opts}
@@ -194,12 +208,14 @@ func detectNumbered(screen string) *Dialog {
 
 // collectOptions reads consecutively numbered option lines (1, 2, 3, …) from the
 // start of lines, tolerating blank lines and wrapped continuation text between
-// them, and stops at the first non-blank line that is neither.
-func collectOptions(lines []string) []DialogOption {
-	var opts []DialogOption
+// them, and stops at the first non-blank line that is neither. It matches each
+// line with its box framing trimmed off, and reports whether the block was
+// framed at all (any option row carried a box border) — the caller rejects an
+// unframed block as ordinary printed output rather than a dialog.
+func collectOptions(lines []string) (opts []DialogOption, boxed bool) {
 	want := 1
 	for _, ln := range lines {
-		m := optionRe.FindStringSubmatch(ln)
+		m := optionRe.FindStringSubmatch(trimBox(ln))
 		if m == nil {
 			if strings.TrimSpace(ln) == "" || len(opts) == 0 {
 				continue
@@ -212,6 +228,9 @@ func collectOptions(lines []string) []DialogOption {
 		if err != nil || n != want {
 			break
 		}
+		if lineFramed(ln) {
+			boxed = true
+		}
 		opts = append(opts, DialogOption{
 			Number:   n,
 			Label:    strings.TrimSpace(m[3]),
@@ -219,7 +238,15 @@ func collectOptions(lines []string) []DialogOption {
 		})
 		want++
 	}
-	return opts
+	return opts, boxed
+}
+
+// lineFramed reports whether a rendered line is part of a drawn box — it carries
+// a vertical border or a box corner. Only genuine box-drawing runes count; the
+// ASCII pipe is excluded because it appears in ordinary text (e.g. "a | b") and
+// would let a bare list masquerade as framed.
+func lineFramed(line string) bool {
+	return strings.ContainsAny(line, "│┃╭╮╰╯┌┐└┘")
 }
 
 // dialogTitle returns the last non-blank line above the options — the dialog's

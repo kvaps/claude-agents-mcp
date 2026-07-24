@@ -122,9 +122,15 @@ func TestDetectDialogIgnoresOrdinaryScreens(t *testing.T) {
 
 // A dialog whose wording is not the one we know must be reported, never
 // answered: a wrong match that answers an unknown question is worse than no
-// match at all.
+// match at all. A real CLI choice dialog is framed in a box, and detection
+// requires that frame.
 func TestUnknownDialogIsReportedNotAnswered(t *testing.T) {
-	screen := "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again\n  3. No"
+	screen := "╭──────────────────────────────────────╮\n" +
+		"│ Do you want to proceed?              │\n" +
+		"│ ❯ 1. Yes                             │\n" +
+		"│   2. Yes, and don't ask again        │\n" +
+		"│   3. No                              │\n" +
+		"╰──────────────────────────────────────╯"
 	d := DetectDialog(screen)
 	if d == nil {
 		t.Fatal("numbered dialog not detected")
@@ -138,8 +144,30 @@ func TestUnknownDialogIsReportedNotAnswered(t *testing.T) {
 	if d.Kind != dialogUnknown {
 		t.Errorf("kind=%q, want %q", d.Kind, dialogUnknown)
 	}
-	if _, ok := d.selectedNumber(); !ok {
-		t.Error("the selection marker was not picked up")
+	if len(d.Options) != 3 {
+		t.Fatalf("got %d options, want 3", len(d.Options))
+	}
+	if sel, ok := d.selectedNumber(); !ok || sel != 1 {
+		t.Errorf("selection = %d (found=%v), want 1", sel, ok)
+	}
+}
+
+// Regression guard for the false positive that wedged resume/fork/auto-resume:
+// Claude constantly prints bare numbered lists, and one sitting on screen right
+// after a resume (the session ended its turn with a numbered list, the REPL
+// prompt below it) must NOT read as a blocking dialog. Without a box frame there
+// is no dialog, so on_resume_dialog never has to route around a phantom.
+func TestBareNumberedListIsNotADialog(t *testing.T) {
+	screens := map[string]string{
+		"list above the live prompt": "Here is the plan:\n" +
+			"1. Update the controller\n2. Add a test\n3. Run the suite\n\n❯ \n? for shortcuts",
+		"parenthesised list":    "Options:\n1) first\n2) second\n3) third\n\n❯ ",
+		"selection-like bullet": "Steps to take:\n❯ 1. do the thing\n  2. then the other thing",
+	}
+	for name, screen := range screens {
+		if d := DetectDialog(screen); d.Blocking() {
+			t.Errorf("%s: a bare numbered list was reported as a dialog (%s)", name, d.Describe())
+		}
 	}
 }
 
