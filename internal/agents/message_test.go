@@ -153,7 +153,7 @@ func TestSendMessageIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendMessage(%q): %v", ref, err)
 	}
-	t.Logf("message %s to %s: %s", out.ID, out.To.Label(), out.Delivery)
+	t.Logf("message %s from %s (addressable=%v) to %s: %s", out.ID, out.From.Label(), out.From.Addressable, out.To.Label(), out.Delivery)
 
 	if out.From.Known() && isSelf(out.From, out.To) {
 		t.Errorf("message was delivered to the sender itself (%s)", out.To.Short)
