@@ -21,6 +21,12 @@ type Session struct {
 	Pinned    bool   `json:"pinned"`    // true if the session is pinned in the agents view (ctrl+t)
 }
 
+// Label renders the session the way messaging refers to it — `name [short]`,
+// degrading to whichever half the session has. It is what an agent reads in a
+// message envelope and in a delivery report, so both halves are shown: the name
+// to recognise the peer, the short id to address it unambiguously.
+func (s Session) Label() string { return label(s.Name, s.Short) }
+
 // Busy reports whether the session is actively processing a turn, so input
 // should wait. It keys off state, not tempo: tempo=="active" only means the
 // session produced output recently and is set even when it is idle at the
