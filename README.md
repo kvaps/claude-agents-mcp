@@ -49,6 +49,11 @@ Attach — everything a human can do inside a session:
 - `send_command` — run a slash command reliably (clears modals → waits for idle → types → submits): `/remote-control`, `/goal`, `/compact`, …; auto-resumes a not-running-but-resumable session in place first, honouring `on_resume_dialog`
 - `cancel` — interrupt the current task (Esc, or Ctrl-C with `hard=true`)
 
+Agents writing to each other:
+
+- `send_message` — write to another agent. Same delivery path as `submit_prompt`, but the text arrives wrapped in an envelope naming the sender and its return address, so the recipient knows it is talking to an agent and can answer with a message of its own instead of replying into its own session where nobody sees it. The sender is not a parameter — it is read from the session this server was started by, so it cannot be spoofed. A recipient mid-turn queues the message instead of being interrupted; a not-running-but-resumable one is resumed in place first (`resume=false` refuses instead, reporting the message as undelivered); a name matching several sessions is refused with the candidates listed rather than delivered to the first match. See [Agents writing to each other](#agents-writing-to-each-other)
+- `whoami` — who *you* are in the fleet: short id, session id, display name, working directory, and whether other agents can reach you (`addressable`). Read from the environment your own session gave this server, so it is you, not a guess — use it to tell a peer how to reach you, or to recognise yourself in `list_sessions`
+
 ## Sessions that dropped off the list
 
 The list entry and the conversation are different artifacts with different lifetimes. `claude rm` clears the entry; the daemon stops tracking sessions it no longer runs. Neither touches `~/.claude/projects/<project>/<sessionId>.jsonl`, and that file *is* the session — everything needed to bring it back with its full history is in it. So a missing list entry is not a missing session.
@@ -102,6 +107,34 @@ A prompt that has not (yet) started a turn is reported as one of three distinct 
 | queued | the session was already running a turn; the prompt is in the input box and the REPL will consume it when that turn ends | nothing. Do not retry (it would deliver twice) and do not send `Enter` |
 | stuck | no dialog, no running turn, text unsubmitted in the box | `Enter` is the right recovery — and has already been retried twice by the time this is reported |
 
+## Agents writing to each other
+
+`submit_prompt` delivers text as if the user had typed it. That is right for seeding a task and wrong for a conversation: the recipient cannot tell that another agent is talking, cannot tell whether anyone is waiting, and has nowhere to answer — its reply goes into its own session, where the sender never sees it. `send_message` is the same delivery path with the two things a conversation needs, identity and a return address.
+
+**The sender is not a parameter.** Claude Code gives every process it starts inside a session — MCP servers included — `CLAUDE_CODE_SESSION_ID` and `CLAUDE_JOB_DIR` (whose base name *is* the short id), so this server knows which session is calling it without being told. An agent therefore cannot claim to be another one, and does not have to know its own name to write to someone. `whoami` reports that same identity back to the caller, including `addressable:false` for a caller nothing can deliver to (a server not started by a background session) — which the envelope then says out loud instead of inviting a reply into the void.
+
+**The envelope** is what the recipient reads:
+
+```text
+<agent-message id="m-8f3a1c" from="orchestrator [a1b2c3d4]" to="reviewer [b2c3d4e5]" at="2026-08-17T21:40:03Z">
+check whether the tests pass
+</agent-message>
+
+[m-8f3a1c] This is a message from another agent, not from your user. It did not interrupt anything and nobody is blocked on it — answer when the work you are doing allows. To answer, call this MCP server's send_message tool (usually mcp__claude-agents__send_message) with to:"a1b2c3d4" — …
+```
+
+The return address is the sender's short id, not its display name: names are not unique, and a message that cannot be answered reliably is barely a message. The message id leads the instruction line for a mechanical reason as well — a delivery is confirmed by finding the body's longest line in the recipient's transcript, and for a short message that line is this boilerplate, identical in every message ever sent; leading with the id keeps two agents writing to the same session at the same moment from confirming each other's deliveries.
+
+**Nothing is interrupted, nothing is silently lost.** A recipient running a turn is not cancelled and not raced: the message lands in its input box and the REPL consumes it when that turn ends, reported to the sender as `queued` — do not resend, that delivers it twice. A recipient holding a dialog is reported as blocked, with the dialog named, rather than rescued by a blind `Enter`. Delivery is confirmed against the recipient's transcript exactly as `submit_prompt` confirms a prompt (see [What "the turn started" means](#what-the-turn-started-means)).
+
+**A sleeping recipient is woken, not skipped.** Not running but resumable means resumed in place first, with its full history, like typing into an exited session in the app. `resume=false` refuses instead and says so — an undelivered message reported as undelivered, never a message dropped on the floor.
+
+**One name, one recipient.** Addressing accepts a short id, a session id or a display name, in that order of precedence, and a name that matches several sessions is refused with the candidates listed unless exactly one of them is live. Every other tool here resolves a reference to the first match, which is fine for actions a human retries; a message put in front of the wrong agent has already been read by the time the mistake shows.
+
+**Delivered is not read.** The call returns when the message has landed in the recipient's conversation, not when it has been read, acted on or answered. Replies arrive later as messages of their own — or not at all. Nothing blocks.
+
+**No second channel.** The message travels over `op:reply`, the daemon control-socket op the `claude` CLI itself uses to hand text to a background session, via the same `SubmitPrompt` that every other delivery here goes through (PTY fallback, verification and all). Recent Claude Code versions do have their own cross-session inbox (`CLAUDE_CODE_MESSAGING_SOCKET`, a per-worker socket under `/tmp/cc-socks`) behind the agent-teams flag; this server deliberately does not speak that undocumented protocol — and it reaches sessions that one does not, since only this path can wake a session that is not running.
+
 ## Status
 
 ### Implemented
@@ -118,6 +151,8 @@ A prompt that has not (yet) started a turn is reported as one of three distinct 
 - [x] `resumable` flag on not-running sessions (`list_sessions` / `get_session`): exited-but-resumable vs really dead, so an orchestrator continues instead of forking
 - [x] Fork a session (`fork_session`): native `--fork-session` into a new entry (new short + session id) carrying the source's full history, source untouched, verify liveness before returning, clean up the worker on any failure
 - [x] Model selection on `create_session` / `fork_session` / `resume_session`: optional `model` (alias or full model id, passed as `--model`, validated by the claude CLI); on resume an explicit model replaces the one the session was launched with
+- [x] Inter-agent messaging (`send_message`): sender identity taken from the environment (not a spoofable parameter), an envelope carrying who is writing and how to answer, queue-don't-interrupt for a busy recipient, auto-resume for a sleeping one, ambiguous names refused with candidates instead of misrouted
+- [x] Self-identification (`whoami`): a session can find out its own short id, name, working directory and whether peers can reach it
 - [x] Rename a session (`ctrl+r`; custom title via `.meta.json` sidecar)
 - [x] Pin / unpin a session (`ctrl+t`; agents-view pin set in `~/.claude/jobs/pins.json`)
 - [x] Reorder a session up/down or to an absolute slot (`shift+↑/↓`; sort keys in `~/.claude/jobs/<id>/order`)
@@ -135,6 +170,8 @@ A prompt that has not (yet) started a turn is reported as one of three distinct 
 - [ ] Live streaming / subscribe tool (push updates as a session changes; today `read_screen` is a pull/snapshot)
 - [ ] Structured detection of permission prompts + a high-level "answer the prompt" tool (the resume dialog is recognised and answerable today; permission prompts are only reported as an unknown dialog)
 - [ ] High-level "answer the session's `needs` question" tool
+- [ ] Read receipts and threading for `send_message` (today a message is confirmed as landed in the recipient's conversation; there is no signal that it was read, and a reply is tied to what it answers only by the message id the recipient quotes)
+- [ ] Broadcast: one message to several recipients, or to a named group (today each recipient is a separate call)
 - [ ] Real-time bidirectional interactive bridge (hand a live session to a human/agent)
 - [ ] Rename reflected in the live daemon roster `name` (today it sets the custom title; the roster name stays the spawn name)
 - [ ] Multi-attacher resize / repaint coordination
@@ -147,6 +184,7 @@ A prompt that has not (yet) started a turn is reported as one of three distinct 
 - create / stop / remove shell out to the stable public `claude` CLI.
 - resume goes through the daemon, not the CLI. `claude --bg --resume` is the wrong tool here: it forks the session — spawning a worker under a fresh short with a new session id and leaving the original as a duplicate not-running entry — and it crashes deterministically (the daemon does not retry) when the session has no transcript ("No conversation found") or its saved cwd is gone ("working directory no longer exists", e.g. a deleted worktree). Instead `resume_session` does exactly what pressing Enter on a session in the agents view does: it sends the daemon an `op:dispatch` with `launch.mode:"resume"` under the session's **own** short, so the session simply goes live in place (same id, single entry). It reconstructs the dispatch descriptor from the session's on-disk job state (`~/.claude/jobs/<short>/state.json`) and authenticates with the daemon control key, validates the saved cwd up front, polls the roster until the worker holds a usable state, and stops the worker on any failure so no crashed/idle session is left behind. Sessions with no on-disk job state (no longer in the agents list) fall back to the CLI resume.
 - the dispatch descriptor must carry `launch.transcriptPath`. The resumed worker's `--resume <sessionId>` lookup only searches the project directory derived from the launch `cwd` (`~/.claude/projects/<sanitized-cwd>/`), so a session whose transcript lives under a different project dir — typically one that switched into a worktree mid-run — exits at startup with "No conversation found" (`exit 1`, `exit_with_message`) and crash-loops, even though the same session resumes fine from the agents view. The picker avoids this by passing the transcript path explicitly in the descriptor; `resume_session` derives the same path from the job state's `linkScanPath` (falling back to a `~/.claude/projects/*/<sessionId>.jsonl` search) and omits it only when no transcript exists yet.
+- `send_message` adds no channel of its own: it renders the envelope and hands it to the same `SubmitPrompt` used for every other delivery (daemon `op:reply`, PTY fallback, transcript verification). What it adds is identity — the sender is read from the environment Claude Code gives this server process (`CLAUDE_CODE_SESSION_ID`, and `CLAUDE_JOB_DIR`, whose base name is the short id), which is also what `whoami` reports, so it is neither a parameter nor a guess.
 - pin / reorder are **not** daemon ops — the agents-view picker keeps them on disk under `~/.claude/jobs`: the pin set in `pins.json` (a JSON array of short ids, written under a lock) and per-session sort keys in `<id>/order` and `<id>/stateOrder`. `pin_session` / `reorder_session` write exactly those files, so the change is durable and any picker reflects it.
 
 Slash commands only work over the raw PTY (`op:attach`): they are REPL input, not conversation messages, so they cannot be delivered through any message/dispatch channel.

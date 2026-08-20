@@ -202,7 +202,8 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("submit_prompt",
-		mcp.WithDescription("Deliver a prompt to a session and reliably submit it in one call (handles bracketed-paste for long/multi-line text, then verifies the turn actually started, retrying Enter once). Use this to (re)seed a session's task instead of send_text+send_keys. A session that is not running but resumable is transparently resumed in place first, keeping its full history — like typing into an exited session in the app — so there is no need to check liveness or call resume_session before continuing a conversation. A session that is no longer in the agents list at all is still reachable by short id or session id: it is found by its transcript on disk and resurrected in its own working directory under its recovered name. goal=true sends it as /goal."),
+		mcp.WithDescription("Deliver a prompt to a session and reliably submit it in one call (handles bracketed-paste for long/multi-line text, then verifies the turn actually started, retrying Enter once). Use this to (re)seed a session's task instead of send_text+send_keys. A session that is not running but resumable is transparently resumed in place first, keeping its full history — like typing into an exited session in the app — so there is no need to check liveness or call resume_session before continuing a conversation. A session that is no longer in the agents list at all is still reachable by short id or session id: it is found by its transcript on disk and resurrected in its own working directory under its recovered name. goal=true sends it as /goal. "+
+			"Text delivered this way arrives as if the session's own user had typed it, which is what seeding a task should look like; to write to an agent AS another agent — named, with a return address it can answer — use send_message instead."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 		mcp.WithString("text", mcp.Required(), mcp.Description("prompt text to deliver and submit (may be long/multi-line)")),
 		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
@@ -412,6 +413,46 @@ func New(version string, a *agents.Client) *server.MCPServer {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		return mcp.NewToolResultText(screen), nil
+	})
+
+	// ---- inter-agent messaging ----
+
+	s.AddTool(mcp.NewTool("send_message",
+		mcp.WithDescription("Write to another agent. Unlike submit_prompt, which delivers text as if the user had typed it, a message arrives wrapped in an envelope (`<agent-message from=\"…\" to=\"…\">`) that names you and tells the recipient how to answer — so it replies to you instead of answering into its own session, where you would never see it. "+
+			"Your identity is not a parameter and cannot be spoofed: it is read from the session this server was started by (whoami reports it), so you do not need to know your own name to write to someone. "+
+			"\n\nDelivery is one-way and asynchronous. The call returns when the message has LANDED, not when it has been read or answered; a reply, if the recipient sends one, arrives later as a message of its own. Never wait on it. "+
+			"A recipient that is mid-turn is never interrupted: the message is queued in its input box and consumed when that turn ends (reported as queued — do not resend, that would deliver it twice). "+
+			"A recipient that is not running is resumed in place first, keeping its full history; pass resume=false to refuse instead, which reports the message as NOT delivered rather than silently dropping it. "+
+			"\n\nAddress the recipient by short id, session id or display name — list_sessions is the address book. A name that matches several sessions is refused with the candidates listed rather than delivered to whichever matched first."),
+		mcp.WithString("to", mcp.Required(), mcp.Description("recipient: short id, session id, or display name (as shown by list_sessions)")),
+		mcp.WithString("message", mcp.Required(), mcp.Description("what to say (may be long/multi-line); write it as one agent to another, including what you want back")),
+		mcp.WithBoolean("resume", mcp.Description("wake a not-running-but-resumable recipient in place before delivering (default true)")),
+		mcp.WithString("on_resume_dialog", mcp.Description(onResumeDialogDesc)),
+	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		dialog, err := resumeDialogChoice(r)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		out, err := a.SendMessage(r.GetString("to", ""), r.GetString("message", ""), agents.MessageOptions{
+			Resume: r.GetBool("resume", true),
+			Dialog: dialog,
+		})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		note := ""
+		if out.ResumeNote != "" {
+			note = fmt.Sprintf("recipient %s was not running — auto-resumed in place; %s; ", out.To.Short, out.ResumeNote)
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("%smessage %s delivered to %s as %s — %s. Delivered is not read: any answer comes back later as a message of its own, so do not wait on it and do not resend.",
+			note, out.ID, out.To.Label(), out.From.Label(), out.Delivery)), nil
+	})
+
+	s.AddTool(mcp.NewTool("whoami",
+		mcp.WithDescription("Report who YOU are in the agents fleet: your short id, session id, display name, working directory, and whether other agents can reach you (`addressable`). It is read from the environment your own session gave this MCP server, so it is you, not a guess. "+
+			"Use it to tell another agent how to reach you, to check the name you are listed under before asking to be renamed, or to recognise yourself in list_sessions. `addressable:false` means no message can be delivered here — this server was not started by a background session — so do not ask peers to reply to you."),
+	), func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return jsonResult(a.Whoami())
 	})
 
 	return s
