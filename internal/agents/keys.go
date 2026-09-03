@@ -7,11 +7,17 @@ import (
 
 // keyBytes maps human key names to the byte sequence a terminal would send.
 var keyBytes = map[string]string{
-	"enter":     "\r",
-	"return":    "\r",
-	"esc":       "\x1b",
-	"escape":    "\x1b",
-	"tab":       "\t",
+	"enter":  "\r",
+	"return": "\r",
+	"esc":    "\x1b",
+	"escape": "\x1b",
+	"tab":    "\t",
+	// CSI Z is the backtab sequence; Claude Code's key parser reads it as tab
+	// with shift set (src/ink/parse-keypress.ts: '[Z' → 'tab', isShiftKey),
+	// which is what its chat:cycleMode binding listens for.
+	"shift-tab": "\x1b[Z",
+	"shifttab":  "\x1b[Z",
+	"backtab":   "\x1b[Z",
 	"space":     " ",
 	"backspace": "\x7f",
 	"delete":    "\x1b[3~",
