@@ -45,7 +45,8 @@ Attach — everything a human can do inside a session:
 
 - `read_screen` — current screen as plain text
 - `send_text` — type text into a session (fire-and-forget by default; `wait=true` blocks and returns the settled screen); auto-resumes a not-running-but-resumable session in place first, honouring `on_resume_dialog`
-- `send_keys` — named keys (fire-and-forget; `wait=true` to block): `enter esc tab space backspace delete up down left right home end pageup pagedown ctrl-c ctrl-d ctrl-u ctrl-l ctrl-z ctrl-r`. **`enter` is a confirmation keystroke, not a neutral one** — whatever holds focus consumes it. Never send it to recover a delivery without reading the screen first; see [The resume dialog](#the-resume-dialog)
+- `send_keys` — named keys (fire-and-forget; `wait=true` to block): `enter esc tab shift-tab space backspace delete up down left right home end pageup pagedown ctrl-c ctrl-d ctrl-u ctrl-l ctrl-z ctrl-r`. **`enter` is a confirmation keystroke, not a neutral one** — whatever holds focus consumes it. Never send it to recover a delivery without reading the screen first; see [The resume dialog](#the-resume-dialog)
+- `set_permission_mode` — change a session's permission mode (`default` / `acceptEdits` / `plan` / `bypassPermissions` / `dontAsk` / `auto`). A live session is switched **in place** through its shift+tab carousel — no restart, no lost turn. `bypassPermissions` is the exception and needs a bypass-capable worker; `restart=true` respawns one with rewritten launch flags, and `allow_bypass=true` makes every later switch free. See [Permission modes](#permission-modes)
 - `send_command` — run a slash command reliably (clears modals → waits for idle → types → submits): `/remote-control`, `/goal`, `/compact`, …; auto-resumes a not-running-but-resumable session in place first, honouring `on_resume_dialog`
 - `cancel` — interrupt the current task (Esc, or Ctrl-C with `hard=true`)
 
@@ -94,6 +95,39 @@ So the tools never send a bare `Enter` to rescue a delivery without first readin
 - When a delivery is blocked, the error names the dialog and its options rather than saying "the turn did not start".
 
 The CLI gates the dialog on roughly 70 minutes since the last message and ~100k estimated tokens (`CLAUDE_CODE_RESUME_THRESHOLD_MINUTES` / `CLAUDE_CODE_RESUME_TOKEN_THRESHOLD` override the thresholds), so it is a long-running-fleet problem specifically: exactly the sessions with the most context to lose.
+
+## Permission modes
+
+`set_permission_mode` changes the mode a session runs under. A live session is switched **in place** by driving its shift+tab carousel: that is not a status-bar toggle — Claude Code's `chat:cycleMode` handler runs `cyclePermissionMode` and writes the result into the tool permission context every tool call is authorised against, then rechecks the queued permission prompts. Nothing is restarted and no context is lost. The keystroke is CSI Z (`ESC [ Z`), which its key parser reads as tab-with-shift.
+
+Verified against a live 2.1.259 worker, the carousel is:
+
+```text
+bypass permissions → auto mode → manual mode → accept edits → plan mode → (back to the top)
+```
+
+`manual mode` is what the default mode calls itself in the footer. **The `bypass permissions` step is present only for a worker that was launched bypass-capable** — a session started `--permission-mode auto` cycles the same ring with that one step missing.
+
+### Why bypass is different
+
+Claude Code decides bypass availability once, at startup:
+
+```js
+// permissionSetup.ts
+const isBypassPermissionsModeAvailable =
+    (permissionMode === 'bypassPermissions' || allowDangerouslySkipPermissions)
+    && !growthBookDisableBypassPermissionsMode && !settingsDisableBypassPermissionsMode
+```
+
+From then on the flag only ever goes *false* (`createDisabledBypassPermissionsContext`); nothing raises it. Every route into bypass tests that same flag and refuses without it — the shift+tab carousel (`getNextPermissionMode`), the SDK `set_permission_mode` control request (`print.ts`), and the claude.ai bridge (`useReplBridge`), the last two with the message *"Cannot set permission mode to bypassPermissions because the session was not launched with `--dangerously-skip-permissions`"*. There is no slash command for it either: `/config` deliberately offers only `default`, `plan`, `acceptEdits`, `dontAsk`, `auto`. So a session started in `auto` or `acceptEdits` **cannot** be talked into bypass, by keystroke or by protocol.
+
+A launch is bypass-capable when it carries `--dangerously-skip-permissions`, `--permission-mode bypassPermissions`, or `--allow-dangerously-skip-permissions` — the last one puts bypass in the carousel *without* switching it on, which is the flag worth passing to any agent whose mode might need raising later.
+
+### Restarting instead of removing
+
+When the mode is out of carousel reach, `restart=true` stops the worker, rewrites the permission flags in `~/.claude/jobs/<short>/state.json` (`respawnFlags` — where the daemon reads launch flags from), and dispatches it back **under its own short**. Same session id, same history, same worktree. `claude rm` is never involved, so its worktree guards ("worktree has uncommitted changes", "worktree has commits that are not pushed anywhere") — which have no force flag and can leave a session unfixable — never come up. The cost is the turn in flight, which is why the restart is opt-in.
+
+`ps` cannot answer the "what mode is this worker in" question, in either direction: workers are claimed from a pool of pre-warmed spare processes, so every one of them shows the same `claude bg-pty-host … --bg-spare …` command line whatever mode it runs in. The permission flags live in the job state, not on the command line.
 
 ## What "the turn started" means
 
@@ -159,7 +193,8 @@ The return address is the sender's short id, not its display name: names are not
 - [x] Delete a session (`ctrl+x` remove / graceful stop)
 - [x] Read a session's screen
 - [x] Type text / submit prompts
-- [x] Send named keys (arrows, Esc, Ctrl-C, …)
+- [x] Send named keys (arrows, Esc, shift+tab, Ctrl-C, …)
+- [x] Change a session's permission mode (`set_permission_mode`): in place via the shift+tab carousel for a live session, or by rewriting `respawnFlags` and re-dispatching under the same short when the target is out of carousel reach — see [Permission modes](#permission-modes)
 - [x] Run slash commands reliably (Esc → wait-idle → type → submit)
 - [x] Cancel the current task (Esc / Ctrl-C)
 - [x] Apache-2.0 license, mandatory `golangci-lint` step

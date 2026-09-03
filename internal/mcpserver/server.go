@@ -357,7 +357,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 	})
 
 	s.AddTool(mcp.NewTool("send_keys",
-		mcp.WithDescription("Send a sequence of named keys, e.g. \"esc down enter\" or \"ctrl-c\". Supported: enter, esc, tab, space, backspace, delete, up, down, left, right, home, end, pageup, pagedown, ctrl-c/d/u/l/z/r. Fire-and-forget by default; pass wait=true to block and return the screen."),
+		mcp.WithDescription("Send a sequence of named keys, e.g. \"esc down enter\" or \"ctrl-c\". Supported: enter, esc, tab, shift-tab, space, backspace, delete, up, down, left, right, home, end, pageup, pagedown, ctrl-c/d/u/l/z/r. Fire-and-forget by default; pass wait=true to block and return the screen. To change a session's permission mode use set_permission_mode rather than driving the shift-tab carousel by hand — it reads the mode back after every step and knows which modes a given worker can actually reach."),
 		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
 		mcp.WithString("keys", mcp.Required(), mcp.Description("comma- or space-separated key names")),
 		mcp.WithBoolean("wait", mcp.Description("block and return the resulting screen (default false: return immediately)")),
@@ -372,6 +372,28 @@ func New(version string, a *agents.Client) *server.MCPServer {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		return mcp.NewToolResultText(sentResult(screen, wait)), nil
+	})
+
+	s.AddTool(mcp.NewTool("set_permission_mode",
+		mcp.WithDescription("Change a session's permission mode — default, acceptEdits, plan, bypassPermissions, dontAsk, auto. A live session is switched IN PLACE through its shift+tab carousel, which changes the permission contract itself (not just the status bar) and costs nothing: no restart, no lost turn, no lost context.\n\nOne mode is special. bypassPermissions is only reachable at runtime by a worker that was LAUNCHED bypass-capable — started with --dangerously-skip-permissions, --permission-mode bypassPermissions, or --allow-dangerously-skip-permissions (which puts bypass in the carousel without switching it on). Claude Code decides this once at startup and never grants it later, so a session started in auto or acceptEdits can NEVER be talked into bypass: its carousel skips from plan straight back to default, and the SDK and bridge control channels both refuse with \"the session was not launched with --dangerously-skip-permissions\". For those sessions pass restart=true: the worker is stopped, its saved launch flags are rewritten, and it is dispatched back under its own short — same session id, same history, same worktree, so `claude rm` (which refuses on a worktree with uncommitted or unpushed work) is never involved. The turn in flight is lost, which is why the restart is opt-in.\n\nPass allow_bypass=true when restarting to add --allow-dangerously-skip-permissions, so every later mode change on that session is a free in-place switch. A not-running session just has its launch flags rewritten; add restart=true to bring it back up in the new mode straight away."),
+		mcp.WithString("session", mcp.Required(), mcp.Description("short id, session id, or name")),
+		mcp.WithString("mode", mcp.Required(), mcp.Description("target mode: default, acceptEdits, plan, bypassPermissions, dontAsk or auto (bypass/dangerous are accepted as aliases for bypassPermissions)")),
+		mcp.WithBoolean("restart", mcp.Description("respawn the worker with rewritten launch flags when the mode cannot be reached in place (keeps the session, its history and its worktree; loses the turn in flight)")),
+		mcp.WithBoolean("allow_bypass", mcp.Description("pass --allow-dangerously-skip-permissions on the restart so bypassPermissions joins this session's carousel and later switches need no restart")),
+	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		mode, err := agents.ParsePermissionMode(r.GetString("mode", ""))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		sess, err := a.Resolve(r.GetString("session", ""))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		out, err := a.SetPermissionMode(sess, mode, r.GetBool("restart", false), r.GetBool("allow_bypass", false))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText(permissionResult(sess, out)), nil
 	})
 
 	s.AddTool(mcp.NewTool("send_command",
@@ -506,6 +528,27 @@ func sentResult(screen string, wait bool) string {
 		return screen
 	}
 	return "sent (fire-and-forget; call read_screen to see output, or pass wait=true)"
+}
+
+// permissionResult renders a mode change as a line that says how the mode was
+// reached, not just that it was: an in-place carousel switch and a respawn have
+// very different costs, and a not-running session has only been queued for the
+// mode rather than put in it.
+func permissionResult(sess agents.Session, out agents.PermissionOutcome) string {
+	flags := ""
+	if len(out.Flags) > 0 {
+		flags = fmt.Sprintf(" Launch flags are now: %s.", strings.Join(out.Flags, " "))
+	}
+	switch {
+	case out.Restarted:
+		return fmt.Sprintf("restarted %s in %s — same session id, history and worktree; the turn it was running was lost.%s", sess.Short, out.Mode, flags)
+	case !out.Live:
+		return fmt.Sprintf("%s is not running; its launch flags now say %s, so it comes up in that mode the next time it starts.%s Pass restart=true to bring it up now.", sess.Short, out.Mode, flags)
+	case out.Previous == out.Mode:
+		return fmt.Sprintf("%s was already in %s; nothing to change.%s", sess.Short, out.Mode, flags)
+	default:
+		return fmt.Sprintf("%s switched in place: %s (no restart, context intact).%s", sess.Short, strings.Join(out.Path, " → "), flags)
+	}
 }
 
 func splitKeys(s string) []string {
