@@ -78,20 +78,22 @@ func controlKey() (string, error) {
 }
 
 // resumeFlags derives the launch flags for a resume from the session's saved
-// respawnFlags, adding bypass-permissions when the caller asked for it and the
-// session was not already launched with a permission mode, and overriding the
-// model when the caller picked one explicitly.
+// respawnFlags, putting the worker in bypass when the caller asked for it and
+// overriding the model when the caller picked one explicitly.
+//
+// A saved --permission-mode is REPLACED, not deferred to. Treating any
+// permission flag as "already handled" is what made `dangerous: true` silently
+// no-op on a session launched with `--permission-mode auto`: the saved flag was
+// left in place, the daemon respawned the worker with it, and the resumed
+// session came back up in auto with no bypass in sight. Since bypass
+// availability is fixed at launch (see BypassAvailableFromFlags), that resume
+// was the one chance to grant it and it was spent doing nothing.
 func resumeFlags(js *JobState, model string, dangerous bool) []string {
 	flags := withModelOverride(js.RespawnFlags, model)
-	if !dangerous {
+	if !dangerous || BypassAvailableFromFlags(flags) {
 		return flags
 	}
-	for _, f := range flags {
-		if f == "--dangerously-skip-permissions" || f == "--permission-mode" {
-			return flags // already carries a permission mode
-		}
-	}
-	return append(flags, "--dangerously-skip-permissions")
+	return ApplyModeToFlags(flags, ModeBypass, false)
 }
 
 // withModelOverride returns a copy of flags with the model applied: any saved

@@ -21,6 +21,12 @@ func TestResumeFlags(t *testing.T) {
 		{"dangerous adds bypass", []string{"--name", "x"}, "", true, []string{"--name", "x", "--dangerously-skip-permissions"}},
 		{"dangerous no dup when already bypass", []string{"--dangerously-skip-permissions"}, "", true, []string{"--dangerously-skip-permissions"}},
 		{"dangerous no dup when perm-mode set", []string{"--permission-mode", "bypassPermissions"}, "", true, []string{"--permission-mode", "bypassPermissions"}},
+		// A saved non-bypass permission mode must be REPLACED, not deferred to:
+		// leaving it in place is what made `dangerous: true` silently resume an
+		// auto-mode session back into auto, with no bypass anywhere.
+		{"dangerous replaces a saved auto mode", []string{"--permission-mode", "auto"}, "", true, []string{"--dangerously-skip-permissions"}},
+		{"dangerous replaces acceptEdits and keeps the rest", []string{"--name", "x", "--permission-mode", "acceptEdits"}, "", true, []string{"--name", "x", "--dangerously-skip-permissions"}},
+		{"dangerous keeps an allow-bypass launch untouched", []string{"--permission-mode", "auto", "--allow-dangerously-skip-permissions"}, "", true, []string{"--permission-mode", "auto", "--allow-dangerously-skip-permissions"}},
 		{"dangerous on empty", nil, "", true, []string{"--dangerously-skip-permissions"}},
 		{"model added when absent", []string{"--name", "x"}, "sonnet", false, []string{"--name", "x", "--model", "sonnet"}},
 		{"model replaces saved --model pair", []string{"--model", "opus", "--name", "x"}, "sonnet", false, []string{"--name", "x", "--model", "sonnet"}},
