@@ -21,8 +21,17 @@ type Client struct{}
 // running yet; the control socket is located lazily on each call.
 func NewClient() *Client { return &Client{} }
 
-// FindSocket locates the freshest control.sock for the current user.
+// FindSocket locates the control.sock of the daemon this session belongs to,
+// falling back to the freshest socket of the current user when that daemon has
+// none — a machine can run one daemon per configuration directory, and the
+// freshest socket is then just as likely to be somebody else's.
 func FindSocket() (string, error) {
+	if dir, err := daemonSocketDir(); err == nil {
+		own := filepath.Join(dir, "control.sock")
+		if _, err := os.Stat(own); err == nil {
+			return own, nil
+		}
+	}
 	pattern := fmt.Sprintf("/tmp/cc-daemon-%d/*/control.sock", os.Getuid())
 	matches, _ := filepath.Glob(pattern)
 	if len(matches) == 0 {
