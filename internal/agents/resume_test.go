@@ -86,6 +86,9 @@ func TestReadJobStateMissingReturnsSentinel(t *testing.T) {
 func TestFindTranscript(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// The daemon's directory follows CLAUDE_CONFIG_DIR; clear it so the
+	// fixtures under the fake HOME are the ones resolved.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	sid := "11111111-2222-3333-4444-555555555555"
 	proj := filepath.Join(home, ".claude", "projects", "-some-worktree-project")
 	if err := os.MkdirAll(proj, 0o755); err != nil {
@@ -125,6 +128,9 @@ func TestResumeDescriptorCarriesTranscriptPath(t *testing.T) {
 	// a different project dir — e.g. one that switched into a worktree.
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// The daemon's directory follows CLAUDE_CONFIG_DIR; clear it so the
+	// fixtures under the fake HOME are the ones resolved.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	sid := "11111111-2222-3333-4444-555555555555"
 	proj := filepath.Join(home, ".claude", "projects", "-elsewhere")
 	if err := os.MkdirAll(proj, 0o755); err != nil {
@@ -176,6 +182,9 @@ func TestResumeDescriptorCarriesTranscriptPath(t *testing.T) {
 func TestResumeDescriptorModelOverride(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// The daemon's directory follows CLAUDE_CONFIG_DIR; clear it so the
+	// fixtures under the fake HOME are the ones resolved.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	sid := "11111111-2222-3333-4444-555555555555"
 	js := &JobState{SessionID: sid, Cwd: home, RespawnFlags: []string{"--model", "opus", "--name", "x"}}
 
@@ -208,6 +217,9 @@ func TestResumeDescriptorModelOverride(t *testing.T) {
 func TestResumable(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// The daemon's directory follows CLAUDE_CONFIG_DIR; clear it so the
+	// fixtures under the fake HOME are the ones resolved.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	writeState := func(t *testing.T, short, body string) {
 		t.Helper()
 		dir := filepath.Join(home, ".claude", "jobs", short)
