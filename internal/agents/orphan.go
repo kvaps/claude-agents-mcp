@@ -49,11 +49,11 @@ func FindOrphan(ref string) *Orphan {
 	if !hexRef.MatchString(ref) {
 		return nil
 	}
-	home, err := os.UserHomeDir()
+	dir, err := projectsDir()
 	if err != nil {
 		return nil
 	}
-	matches, _ := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", ref+"*.jsonl"))
+	matches, _ := filepath.Glob(filepath.Join(dir, "*", ref+"*.jsonl"))
 	if len(matches) == 0 {
 		return nil
 	}
