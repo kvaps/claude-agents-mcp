@@ -459,15 +459,16 @@ type WaitOptions struct {
 	Timeout time.Duration
 }
 
-// Wait timing. The poll interval bounds how late a message can be noticed; the
-// default timeout is short enough to sit under any MCP client's tool-call
-// timeout, and the cap keeps a caller from parking a worker for an hour by
-// mistake (a client that wants to wait longer calls again — the cursor makes
-// that free).
+// Wait timing. The poll interval bounds how late a message can be noticed. The
+// default timeout sits under every MCP client's default tool-call timeout seen
+// so far (Codex documents 60 s and ships 300 s; Claude Code's is configurable),
+// and the cap keeps one call from outliving the client that made it: Codex's
+// current default tool timeout is 300 s, so a wait never exceeds it, and a
+// client that wants to listen longer calls again — the cursor makes that free.
 const (
 	waitPollInterval   = 200 * time.Millisecond
 	DefaultWaitTimeout = 30 * time.Second
-	MaxWaitTimeout     = 10 * time.Minute
+	MaxWaitTimeout     = 5 * time.Minute
 )
 
 // Wait blocks until the mailbox has at least one message to return, the timeout
