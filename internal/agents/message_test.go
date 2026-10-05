@@ -47,6 +47,17 @@ func TestEnvelopeUnaddressableSender(t *testing.T) {
 	}
 }
 
+// TestEnvelopeFromClient: a message relayed by an MCP client says so, names the
+// mailbox to answer to, and still says it is not the recipient's user.
+func TestEnvelopeFromClient(t *testing.T) {
+	got := envelope("m-abc123", Self{Kind: KindClient, Mailbox: "codex", Addressable: true}, testRecipient, "status?", testAt)
+	for _, want := range []string{`from="codex"`, "an MCP client (codex)", "not from your user", "untrusted", `to:"codex"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("client envelope is missing %q:\n%s", want, got)
+		}
+	}
+}
+
 // TestEnvelopeQuotesInNames: a display name is free text and can contain the
 // quote character that delimits the envelope's attributes. It must not break the
 // tag it sits in.
@@ -87,8 +98,8 @@ func TestNewMessageIDUnique(t *testing.T) {
 	seen := map[string]bool{}
 	for i := 0; i < 100; i++ {
 		id := newMessageID()
-		if !strings.HasPrefix(id, "m-") || len(id) != 8 {
-			t.Fatalf("message id %q is not of the form m-xxxxxx", id)
+		if !strings.HasPrefix(id, "m-") || len(id) != 14 {
+			t.Fatalf("message id %q is not of the form m-xxxxxxxxxxxx", id)
 		}
 		if seen[id] {
 			t.Fatalf("duplicate message id %q", id)
@@ -101,13 +112,16 @@ func TestIsSelf(t *testing.T) {
 	cases := []struct {
 		name   string
 		self   Self
-		target Session
+		target Recipient
 		want   bool
 	}{
-		{"same short", testSender, Session{Short: "a1b2c3d4"}, true},
-		{"same session id, no short yet", testSender, Session{SessionID: testSender.SessionID}, true},
-		{"another session", testSender, testRecipient, false},
-		{"unidentified caller never matches", Self{}, Session{Short: "", SessionID: ""}, false},
+		{"same short", testSender, Recipient{Session: Session{Short: "a1b2c3d4"}}, true},
+		{"same session id, no short yet", testSender, Recipient{Session: Session{SessionID: testSender.SessionID}}, true},
+		{"another session", testSender, Recipient{Session: testRecipient}, false},
+		{"unidentified caller never matches", Self{}, Recipient{Session: Session{Short: "", SessionID: ""}}, false},
+		{"client writing to its own mailbox", Self{Kind: KindClient, Mailbox: "codex"}, Recipient{Mailbox: "codex"}, true},
+		{"client writing to another mailbox", Self{Kind: KindClient, Mailbox: "codex"}, Recipient{Mailbox: "voice"}, false},
+		{"session writing to a mailbox", testSender, Recipient{Mailbox: "codex"}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -146,7 +160,7 @@ func TestSendMessageIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve %q: %v", ref, err)
 	}
-	mark := markTranscript(target.SessionID)
+	mark := markTranscript(target.Session.SessionID)
 
 	body := fmt.Sprintf("This is an automated delivery test from claude-agents-mcp (%s). No action is needed and no answer is expected — ignore it and carry on.", time.Now().Format(time.RFC3339))
 	out, err := c.SendMessage(ref, body, MessageOptions{Resume: true, Dialog: DialogKeep})
@@ -156,7 +170,7 @@ func TestSendMessageIntegration(t *testing.T) {
 	t.Logf("message %s from %s (addressable=%v) to %s: %s", out.ID, out.From.Label(), out.From.Addressable, out.To.Label(), out.Delivery)
 
 	if out.From.Known() && isSelf(out.From, out.To) {
-		t.Errorf("message was delivered to the sender itself (%s)", out.To.Short)
+		t.Errorf("message was delivered to the sender itself (%s)", out.To.Label())
 	}
 	if !strings.Contains(out.Body, out.ID) {
 		t.Errorf("envelope does not carry its own message id %s:\n%s", out.ID, out.Body)
@@ -167,7 +181,7 @@ func TestSendMessageIntegration(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for !mark.Landed(out.Body) {
 		if time.Now().After(deadline) {
-			t.Fatalf("message %s reported as %q but never appeared in %s's transcript", out.ID, out.Delivery, out.To.Short)
+			t.Fatalf("message %s reported as %q but never appeared in %s's transcript", out.ID, out.Delivery, out.To.Label())
 		}
 		time.Sleep(250 * time.Millisecond)
 	}

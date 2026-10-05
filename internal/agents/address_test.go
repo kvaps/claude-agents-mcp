@@ -37,12 +37,12 @@ func TestPickTarget(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := pickTarget(c.ref, fleet)
+			got, err := pickTarget(c.ref, fleet, nil)
 			if err != nil {
 				t.Fatalf("pickTarget(%q) failed: %v", c.ref, err)
 			}
-			if got.Short != c.wantShort {
-				t.Fatalf("pickTarget(%q) = %s, want %s", c.ref, got.Short, c.wantShort)
+			if got.Session.Short != c.wantShort {
+				t.Fatalf("pickTarget(%q) = %s, want %s", c.ref, got.Session.Short, c.wantShort)
 			}
 		})
 	}
@@ -56,7 +56,7 @@ func TestPickTarget(t *testing.T) {
 func TestPickTargetAmbiguous(t *testing.T) {
 	for _, ref := range []string{"reviewer", "REVIEWER"} {
 		t.Run(ref, func(t *testing.T) {
-			_, err := pickTarget(ref, fleet)
+			_, err := pickTarget(ref, fleet, nil)
 			var ambiguous *AmbiguousRefError
 			if !errors.As(err, &ambiguous) {
 				t.Fatalf("pickTarget(%q) error = %v, want *AmbiguousRefError", ref, err)
@@ -78,8 +78,8 @@ func TestPickTargetAmbiguous(t *testing.T) {
 func TestPickTargetNotFound(t *testing.T) {
 	for _, ref := range []string{"", "   ", "nobody", "99999999"} {
 		t.Run(ref, func(t *testing.T) {
-			if got, err := pickTarget(ref, fleet); err == nil {
-				t.Fatalf("pickTarget(%q) = %s, want an error", ref, got.Short)
+			if got, err := pickTarget(ref, fleet, []string{"codex"}); err == nil {
+				t.Fatalf("pickTarget(%q) = %s, want an error", ref, got.Label())
 			}
 		})
 	}
@@ -90,11 +90,48 @@ func TestPickTargetNotFound(t *testing.T) {
 // space, so they are matched first.
 func TestPickTargetPrefersIDsOverNames(t *testing.T) {
 	sessions := append([]Session{{Short: "11112222", SessionID: "11112222-aaaa-bbbb-cccc-dddddddddddd", Name: "a1b2c3d4", Live: true}}, fleet...)
-	got, err := pickTarget("a1b2c3d4", sessions)
+	got, err := pickTarget("a1b2c3d4", sessions, nil)
 	if err != nil {
 		t.Fatalf("pickTarget: %v", err)
 	}
-	if got.Short != "a1b2c3d4" {
-		t.Fatalf("pickTarget(\"a1b2c3d4\") = %s, want the session whose short id it is", got.Short)
+	if got.Session.Short != "a1b2c3d4" {
+		t.Fatalf("pickTarget(\"a1b2c3d4\") = %s, want the session whose short id it is", got.Session.Short)
+	}
+}
+
+// TestPickTargetMailbox: a mailbox is addressed by its name like a session by
+// its display name, case-insensitively, and resolves to a mailbox recipient.
+func TestPickTargetMailbox(t *testing.T) {
+	for _, ref := range []string{"codex", "Codex", " codex "} {
+		got, err := pickTarget(ref, fleet, []string{"codex", "voice"})
+		if err != nil {
+			t.Fatalf("pickTarget(%q): %v", ref, err)
+		}
+		if !got.IsMailbox() || got.Mailbox != "codex" || got.Kind() != RecipientMailbox || got.Address() != "codex" || got.Label() != "codex" {
+			t.Fatalf("pickTarget(%q) = %+v, want the codex mailbox", ref, got)
+		}
+	}
+}
+
+// TestPickTargetMailboxVersusName: a mailbox and a session sharing a name is
+// not resolved by preferring either — the message would reach the wrong one —
+// but reported with both candidates named.
+func TestPickTargetMailboxVersusName(t *testing.T) {
+	sessions := append([]Session{{Short: "11112222", SessionID: "11112222-aaaa-bbbb-cccc-dddddddddddd", Name: "codex", Live: true}}, fleet...)
+	_, err := pickTarget("codex", sessions, []string{"codex"})
+	var ambiguous *AmbiguousRefError
+	if !errors.As(err, &ambiguous) {
+		t.Fatalf("error = %v, want *AmbiguousRefError", err)
+	}
+	for _, want := range []string{"11112222", "codex (mailbox)"} {
+		if !strings.Contains(ambiguous.Error(), want) {
+			t.Errorf("error %q does not name %s", ambiguous.Error(), want)
+		}
+	}
+	// An id still wins over a mailbox named like it would be impossible (ids are
+	// refused as mailbox names), but a mailbox never shadows a short id lookup.
+	got, err := pickTarget("11112222", sessions, []string{"codex"})
+	if err != nil || got.Session.Short != "11112222" {
+		t.Fatalf("pickTarget by short id with mailboxes present = %+v, %v", got, err)
 	}
 }

@@ -17,6 +17,9 @@ import (
 // New builds the MCP server exposing claude agents control + attach actions.
 func New(version string, a *agents.Client) *server.MCPServer {
 	s := server.NewMCPServer("claude-agents-mcp", version)
+	// A client's mailbox exists from the moment its server process starts, so
+	// agents can address it before it has read anything. No-op for a session.
+	a.EnsureOwnMailbox()
 
 	// ---- session management ----
 
@@ -437,18 +440,19 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		return mcp.NewToolResultText(screen), nil
 	})
 
-	// ---- inter-agent messaging ----
+	// ---- messaging: agents and MCP clients writing to each other ----
 
 	s.AddTool(mcp.NewTool("send_message",
-		mcp.WithDescription("Write to another agent. Unlike submit_prompt, which delivers text as if the user had typed it, a message arrives wrapped in an envelope (`<agent-message from=\"…\" to=\"…\">`) that names you and tells the recipient how to answer — so it replies to you instead of answering into its own session, where you would never see it. "+
-			"Your identity is not a parameter and cannot be spoofed: it is read from the session this server was started by (whoami reports it), so you do not need to know your own name to write to someone. "+
-			"\n\nDelivery is one-way and asynchronous. The call returns when the message has LANDED, not when it has been read or answered; a reply, if the recipient sends one, arrives later as a message of its own. Never wait on it. "+
-			"A recipient that is mid-turn is never interrupted: the message is queued in its input box and consumed when that turn ends (reported as queued — do not resend, that would deliver it twice). "+
-			"A recipient that is not running is resumed in place first, keeping its full history; pass resume=false to refuse instead, which reports the message as NOT delivered rather than silently dropping it. "+
-			"\n\nAddress the recipient by short id, session id or display name — list_sessions is the address book. A name that matches several sessions is refused with the candidates listed rather than delivered to whichever matched first."),
-		mcp.WithString("to", mcp.Required(), mcp.Description("recipient: short id, session id, or display name (as shown by list_sessions)")),
+		mcp.WithDescription("Write to another agent or to an MCP client's mailbox. Unlike submit_prompt, which delivers text as if the user had typed it, a message to a session arrives wrapped in an envelope (`<agent-message from=\"…\" to=\"…\">`) that names you and tells the recipient how to answer — so it replies to you instead of answering into its own session, where you would never see it. A message to a mailbox (an MCP client such as Codex, see list_mailboxes) is stored there until the client reads it. "+
+			"Your identity is not a parameter and cannot be spoofed: it is read from the environment this server process was started with (whoami reports it), so you do not need to know your own name to write to someone. "+
+			"\n\nThe result is JSON with the message `id` and a `status`: `delivered` (in the recipient's conversation, confirmed against its transcript), `queued` (a session recipient has it in its input box behind the turn it is running and will consume it when that turn ends; a mailbox recipient has not fetched it yet), or `failed` with a reason. Nothing here means read or answered: a reply, if the recipient sends one, arrives later as a message of its own. Never wait on it, never resend — a queued message is delivered. Check later with message_status if you must. "+
+			"Pass idempotency_key (any token of your own, up to 64 chars) when you might retry the call: a second send with the same key does not deliver again, it returns the first message's record with `duplicate:true`. "+
+			"A recipient session that is not running is resumed in place first, keeping its full history; pass resume=false to refuse instead, which reports the message as NOT delivered rather than silently dropping it. "+
+			"\n\nAddress the recipient by short id, session id, display name or mailbox name — list_sessions and list_mailboxes are the address book. A name that matches several recipients is refused with the candidates listed rather than delivered to whichever matched first. What you write is delivered to the recipient as untrusted content from a peer, not as its user's instruction."),
+		mcp.WithString("to", mcp.Required(), mcp.Description("recipient: short id, session id, display name (as shown by list_sessions) or mailbox name (as shown by list_mailboxes)")),
 		mcp.WithString("message", mcp.Required(), mcp.Description("what to say (may be long/multi-line); write it as one agent to another, including what you want back")),
-		mcp.WithBoolean("resume", mcp.Description("wake a not-running-but-resumable recipient in place before delivering (default true)")),
+		mcp.WithString("idempotency_key", mcp.Description("your own token for this send; repeating it never delivers twice (letters, digits, . _ : -, up to 64 chars)")),
+		mcp.WithBoolean("resume", mcp.Description("wake a not-running-but-resumable session recipient in place before delivering (default true)")),
 		mcp.WithString("on_resume_dialog", mcp.Description(onResumeDialogDesc)),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		dialog, err := resumeDialogChoice(r)
@@ -458,21 +462,20 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		out, err := a.SendMessage(r.GetString("to", ""), r.GetString("message", ""), agents.MessageOptions{
 			Resume: r.GetBool("resume", true),
 			Dialog: dialog,
+			Key:    strings.TrimSpace(r.GetString("idempotency_key", "")),
 		})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		note := ""
-		if out.ResumeNote != "" {
-			note = fmt.Sprintf("recipient %s was not running — auto-resumed in place; %s; ", out.To.Short, out.ResumeNote)
-		}
-		return mcp.NewToolResultText(fmt.Sprintf("%smessage %s delivered to %s as %s — %s. Delivered is not read: any answer comes back later as a message of its own, so do not wait on it and do not resend.",
-			note, out.ID, out.To.Label(), out.From.Label(), out.Delivery)), nil
+		return jsonResult(sendResult{
+			ID: out.ID, Status: out.Status, From: out.From.Label(), To: out.To.Label(), ToKind: out.To.Kind(), ToAddress: out.To.Address(),
+			Delivery: out.Delivery, ResumeNote: out.ResumeNote, Duplicate: out.Duplicate, Note: sendNote(out),
+		})
 	})
 
 	s.AddTool(mcp.NewTool("whoami",
-		mcp.WithDescription("Report who YOU are in the agents fleet: your short id, session id, display name, working directory, and whether other agents can reach you (`addressable`). It is read from the environment your own session gave this MCP server, so it is you, not a guess. "+
-			"Use it to tell another agent how to reach you, to check the name you are listed under before asking to be renamed, or to recognise yourself in list_sessions. `addressable:false` means no message can be delivered here — this server was not started by a background session — so do not ask peers to reply to you."),
+		mcp.WithDescription("Report who YOU are to this server: `kind` session (a Claude Code session, with short id, session id, display name and working directory) or client (an MCP client such as Codex, with the `mailbox` it reads), and whether other agents can reach you (`addressable`). It is read from the environment your own process gave this MCP server, so it is you, not a guess. "+
+			"Use it to tell another agent how to reach you, to check the name you are listed under before asking to be renamed, or to recognise yourself in list_sessions. `addressable:false` means no message can be delivered here — a session the daemon does not list, or a client whose mailbox is not configured (set CLAUDE_AGENTS_MAILBOX in the server's environment, or call register_mailbox) — so do not ask peers to reply to you."),
 	), func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return jsonResult(a.Whoami())
 	})
@@ -555,4 +558,40 @@ func splitKeys(s string) []string {
 	return strings.FieldsFunc(s, func(r rune) bool {
 		return r == ',' || r == ' ' || r == '\t'
 	})
+}
+
+// sendResult is the JSON a send_message call returns: machine-readable for a
+// client that tracks ids and statuses, with a note that says what to do next.
+type sendResult struct {
+	ID         string `json:"id"`
+	Status     string `json:"status"`
+	From       string `json:"from"`
+	To         string `json:"to"`
+	ToKind     string `json:"to_kind"`
+	ToAddress  string `json:"to_address"`
+	Delivery   string `json:"delivery,omitempty"`
+	ResumeNote string `json:"resume_note,omitempty"`
+	Duplicate  bool   `json:"duplicate,omitempty"`
+	Note       string `json:"note"`
+}
+
+// sendNote tells the sender what its status means and what not to do about it.
+// The two kinds of recipient and the queued/delivered split want different
+// words, and "do not resend" belongs in every one of them.
+func sendNote(out agents.MessageOutcome) string {
+	if out.Duplicate {
+		return fmt.Sprintf("Not sent again: this idempotency key was already used for message %s, and this is that message's current status. Do not resend.", out.ID)
+	}
+	prefix := ""
+	if out.ResumeNote != "" {
+		prefix = fmt.Sprintf("Recipient %s was not running — auto-resumed in place; %s. ", out.To.Label(), out.ResumeNote)
+	}
+	switch {
+	case out.To.IsMailbox():
+		return prefix + fmt.Sprintf("Stored in mailbox %s; the status becomes delivered when the client fetches it and read when it acknowledges it (message_status shows the current one). Any answer arrives later as a message of its own — do not wait on it and do not resend.", out.To.Mailbox)
+	case out.Status == agents.StatusQueued:
+		return prefix + "Queued in the recipient's input box behind the turn it is running; the REPL consumes it when that turn ends. Do not resend and do not send Enter — either would deliver it twice or interrupt the running turn."
+	default:
+		return prefix + fmt.Sprintf("Landed in the recipient's conversation (%s). Delivered is not read: any answer comes back later as a message of its own, so do not wait on it and do not resend.", out.Delivery)
+	}
 }

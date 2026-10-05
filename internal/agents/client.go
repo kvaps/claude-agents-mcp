@@ -15,7 +15,12 @@ import (
 
 // Client talks to the local `claude agents` daemon over its control socket.
 // The socket is resolved on every call, so the client survives daemon restarts.
-type Client struct{}
+type Client struct {
+	// listFn, when set, replaces List as the address book for message
+	// resolution. Tests install it to resolve against a fixed fleet without a
+	// daemon; production clients leave it nil.
+	listFn func() ([]Session, error)
+}
 
 // NewClient returns a daemon client. It does not require the daemon to be
 // running yet; the control socket is located lazily on each call.

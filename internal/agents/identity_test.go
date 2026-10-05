@@ -1,6 +1,9 @@
 package agents
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestEnvSelf covers how the calling session is identified from the environment
 // Claude Code hands its child processes. This is the whole basis of message
@@ -56,9 +59,16 @@ func TestEnvSelf(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			isolateIdentity(t)
 			t.Setenv(envSessionID, c.sessionID)
 			t.Setenv(envJobDir, c.jobDir)
 			got := envSelf()
+			if c.wantKnown && got.Kind != KindSession {
+				t.Errorf("Kind = %q, want %q", got.Kind, KindSession)
+			}
+			if !c.wantKnown && got.Kind != KindUnknown {
+				t.Errorf("Kind = %q, want %q", got.Kind, KindUnknown)
+			}
 			if got.Short != c.wantShort {
 				t.Errorf("Short = %q, want %q", got.Short, c.wantShort)
 			}
@@ -107,6 +117,12 @@ func TestSelfAddressLabel(t *testing.T) {
 			wantAddress: "",
 			wantLabel:   "unknown",
 		},
+		{
+			name:        "client: the mailbox is both address and label",
+			self:        Self{Kind: KindClient, Mailbox: "codex"},
+			wantAddress: "codex",
+			wantLabel:   "codex",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -125,13 +141,119 @@ func TestSelfAddressLabel(t *testing.T) {
 // cannot be reached must not invite replies. It touches the daemon only through
 // Resolve, which is never called for an unidentified caller, so it is hermetic.
 func TestWhoamiUnknownEnvironment(t *testing.T) {
-	t.Setenv(envSessionID, "")
-	t.Setenv(envJobDir, "")
+	isolateIdentity(t)
 	self := NewClient().Whoami()
 	if self.Known() {
 		t.Fatalf("Whoami() = %+v, want an unidentified caller", self)
 	}
 	if self.Addressable {
 		t.Error("an unidentified caller must not be reported as addressable")
+	}
+}
+
+// isolateIdentity clears every environment variable and on-disk default the
+// identity is read from, so a test sees only what it sets itself.
+func isolateIdentity(t *testing.T) {
+	t.Helper()
+	t.Setenv(envSessionID, "")
+	t.Setenv(envJobDir, "")
+	t.Setenv(envMailbox, "")
+	t.Setenv(envStateDir, t.TempDir())
+}
+
+// TestEnvSelfClient covers the caller that is not a session: an MCP client. Its
+// mailbox comes from the environment the client's configuration gave the server,
+// which wins over everything else because it is explicit; without it, a process
+// that is not a session falls back to the registered default; an invalid name in
+// the environment is ignored rather than becoming an unusable identity.
+func TestEnvSelfClient(t *testing.T) {
+	isolateIdentity(t)
+	t.Setenv(envMailbox, "Codex")
+	got := envSelf()
+	if got.Kind != KindClient || got.Mailbox != "codex" || !got.IsClient() || !got.Known() {
+		t.Fatalf("envSelf with %s set = %+v", envMailbox, got)
+	}
+
+	// Explicit mailbox beats a session environment.
+	t.Setenv(envSessionID, "58ce5347-abfd-474f-973b-29bd4821769a")
+	if got := envSelf(); got.Kind != KindClient || got.Mailbox != "codex" {
+		t.Fatalf("session env overrode an explicit mailbox: %+v", got)
+	}
+
+	// An invalid name is not an identity; the session wins.
+	t.Setenv(envMailbox, "Not A Mailbox")
+	if got := envSelf(); got.Kind != KindSession || got.Short != "58ce5347" {
+		t.Fatalf("invalid mailbox name produced %+v", got)
+	}
+
+	// No environment at all: the registered default, when there is one.
+	isolateIdentity(t)
+	if err := SetDefaultClientMailbox("voice"); err != nil {
+		t.Fatal(err)
+	}
+	if got := envSelf(); got.Kind != KindClient || got.Mailbox != "voice" {
+		t.Fatalf("default client mailbox not picked up: %+v", got)
+	}
+}
+
+// TestWhoamiClient: a client is addressable once its mailbox exists, and
+// OwnMailbox is what makes it exist.
+func TestWhoamiClient(t *testing.T) {
+	isolateIdentity(t)
+	t.Setenv(envMailbox, "codex")
+	c := NewClient()
+	if self := c.Whoami(); self.Addressable {
+		t.Fatalf("client reported addressable before its mailbox exists: %+v", self)
+	}
+	mb, err := c.OwnMailbox()
+	if err != nil || mb.Name != "codex" || !mb.Exists() {
+		t.Fatalf("OwnMailbox: %v (%+v)", err, mb)
+	}
+	if self := c.Whoami(); !self.Addressable || self.Address() != "codex" {
+		t.Fatalf("client not addressable after OwnMailbox: %+v", self)
+	}
+}
+
+// TestOwnMailboxRefusesSessionsAndStrangers: a session has a conversation to
+// receive in, and an unidentified caller has to say who it is first.
+func TestOwnMailboxRefusesSessionsAndStrangers(t *testing.T) {
+	isolateIdentity(t)
+	c := NewClient()
+	if _, err := c.OwnMailbox(); err == nil || !strings.Contains(err.Error(), envMailbox) {
+		t.Fatalf("unidentified caller: err = %v, want a hint naming %s", err, envMailbox)
+	}
+	t.Setenv(envJobDir, "/Users/x/.claude/jobs/a1b2c3d4")
+	if _, err := c.OwnMailbox(); err == nil || !strings.Contains(err.Error(), "conversation") {
+		t.Fatalf("session caller: err = %v, want a refusal", err)
+	}
+}
+
+// TestRegisterMailbox: registering fixes the default for every later client
+// process, is refused for a session, and cannot contradict an explicit
+// environment.
+func TestRegisterMailbox(t *testing.T) {
+	isolateIdentity(t)
+	c := NewClient()
+	mb, err := c.RegisterMailbox(" Codex ")
+	if err != nil || mb.Name != "codex" || !mb.Exists() {
+		t.Fatalf("RegisterMailbox: %v (%+v)", err, mb)
+	}
+	if DefaultClientMailbox() != "codex" {
+		t.Fatalf("default after register = %q", DefaultClientMailbox())
+	}
+	if self := c.Whoami(); !self.IsClient() || !self.Addressable || self.Mailbox != "codex" {
+		t.Fatalf("Whoami after register = %+v", self)
+	}
+	t.Setenv(envMailbox, "voice")
+	if _, err := c.RegisterMailbox("codex"); err == nil {
+		t.Fatal("registering a name that contradicts the environment succeeded")
+	}
+	if _, err := c.RegisterMailbox("voice"); err != nil {
+		t.Fatalf("registering the environment's own name failed: %v", err)
+	}
+	isolateIdentity(t)
+	t.Setenv(envSessionID, "58ce5347-abfd-474f-973b-29bd4821769a")
+	if _, err := c.RegisterMailbox("codex"); err == nil {
+		t.Fatal("a session registered a mailbox")
 	}
 }
