@@ -116,7 +116,8 @@ func TestLiveSmoke(t *testing.T) {
 	waitIdle(t, ctx, call, target)
 	for _, mode := range []string{"auto", "plan", "acceptEdits", "auto"} {
 		raw, isErr, err = call(ctx, "set_permission_mode", map[string]any{"session": target, "mode": mode})
-		if err != nil || isErr || !(strings.Contains(raw, "switched in place") || strings.Contains(raw, "was already in")) {
+		switched := strings.Contains(raw, "switched in place") || strings.Contains(raw, "was already in")
+		if err != nil || isErr || !switched {
 			t.Fatalf("set_permission_mode %s: %v / %s", mode, err, raw)
 		}
 		t.Logf("set_permission_mode %s: %s", mode, raw)
