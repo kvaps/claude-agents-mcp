@@ -1,6 +1,6 @@
 # claude-agents-mcp
 
-An MCP server that lets an agent (or you) drive local **`claude agents`** background sessions programmatically — everything a human can do via `attach`, plus session management.
+An MCP server that lets an agent (or you) drive local **`claude agents`** background sessions programmatically — everything a human can do via `attach`, plus session management, plus messaging between the sessions and any MCP client (Codex included) that connects to it.
 
 It talks to the native Claude Code daemon over its control socket (`/tmp/cc-daemon-<uid>/*/control.sock`) and the public `claude` CLI. There is no separate daemon — it's the same one `claude agents` and `claude --bg` already use.
 
@@ -8,7 +8,7 @@ It talks to the native Claude Code daemon over its control socket (`/tmp/cc-daem
 
 When you run many `claude agents` sessions, a human can attach to any of them and read the screen, type, run slash commands (`/remote-control`, `/goal`, …), cancel a task, and manage the fleet. This server exposes those same actions as MCP tools so an orchestrating agent can do them too.
 
-## Build
+## Build, install, update
 
 ```sh
 make all        # tidy + lint + build  (golangci-lint is a mandatory step)
@@ -16,15 +16,45 @@ make all        # tidy + lint + build  (golangci-lint is a mandatory step)
 go build -o claude-agents-mcp ./cmd/claude-agents-mcp
 ```
 
-Requirements: Go 1.24+, `golangci-lint`, and the `claude` CLI in `PATH`.
+Requirements: Go 1.25+, `golangci-lint`, and the `claude` CLI in `PATH`.
+
+Installing or updating the binary that clients run:
+
+```sh
+go build -o claude-agents-mcp.new ./cmd/claude-agents-mcp
+mv claude-agents-mcp.new ~/.local/bin/claude-agents-mcp     # mv, never cp
+codesign --force --sign - ~/.local/bin/claude-agents-mcp    # macOS
+```
+
+`mv` gives the path a new inode: server processes already running keep executing the old file and finish on it, while every client that starts afterwards gets the new one. `cp` writes into the inode those processes are executing from. On macOS, replacing the binary also invalidates its signature, and the next process to start it is killed with SIGKILL and no message — re-signing ad hoc fixes that. Nothing has to be restarted: every Claude Code session and every Codex instance starts its own server process, so each picks up the new binary the next time it (re)starts.
 
 ## Use with Claude Code
 
 ```sh
-claude mcp add claude-agents -- /path/to/claude-agents-mcp
+claude mcp add --scope user claude-agents -- ~/.local/bin/claude-agents-mcp
 ```
 
-The server speaks MCP over stdio.
+The server speaks MCP over stdio. Registered user-scope it is available in every session, which is what makes a background agent able to answer a message: the tool it answers with is the same server, started by its own session.
+
+## Use with Codex
+
+Codex (the CLI, the desktop app and the IDE extension share one configuration) starts the server over stdio from `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.claude-agents]
+command = "/Users/you/.local/bin/claude-agents-mcp"
+enabled = true
+tool_timeout_sec = 600
+
+[mcp_servers.claude-agents.env]
+CLAUDE_AGENTS_MAILBOX = "codex"
+```
+
+- `CLAUDE_AGENTS_MAILBOX` is Codex's identity. It is read from the server process's environment, not from a tool parameter, so Codex is `codex` to every agent because its configuration says so — the same way a session is itself because Claude Code's environment says so. Without it, Codex calls `register_mailbox` once and the name is remembered for every later process (`~/.claude/claude-agents-mcp/client-mailbox`); the environment variable, when set, takes precedence.
+- `tool_timeout_sec` matters because `wait_for_messages` blocks. Codex's per-tool timeout defaults to 300 s in current builds (`DEFAULT_TOOL_TIMEOUT` in `codex-rs/codex-mcp/src/rmcp_client.rs`, raised from 120 s by openai/codex#28234) and was 60–120 s before; the configuration reference still documents 60 s. The server caps one wait at 300 s and defaults to 30 s, so set the client timeout above the waits you intend to use, or keep the waits short and call again.
+- `codex mcp list` shows the server as `enabled`; `whoami` from inside Codex then reports `kind: client`, `mailbox: codex`, `addressable: true`.
+
+What Codex can and cannot do with this is set out in [Where automatic wake-up ends](#where-automatic-wake-up-ends).
 
 ## Tools
 
@@ -50,10 +80,19 @@ Attach — everything a human can do inside a session:
 - `send_command` — run a slash command reliably (clears modals → waits for idle → types → submits): `/remote-control`, `/goal`, `/compact`, …; auto-resumes a not-running-but-resumable session in place first, honouring `on_resume_dialog`
 - `cancel` — interrupt the current task (Esc, or Ctrl-C with `hard=true`)
 
-Agents writing to each other:
+Messaging — agents and MCP clients writing to each other:
 
-- `send_message` — write to another agent. Same delivery path as `submit_prompt`, but the text arrives wrapped in an envelope naming the sender and its return address, so the recipient knows it is talking to an agent and can answer with a message of its own instead of replying into its own session where nobody sees it. The sender is not a parameter — it is read from the session this server was started by, so it cannot be spoofed. A recipient mid-turn queues the message instead of being interrupted; a not-running-but-resumable one is resumed in place first (`resume=false` refuses instead, reporting the message as undelivered); a name matching several sessions is refused with the candidates listed rather than delivered to the first match. See [Agents writing to each other](#agents-writing-to-each-other)
-- `whoami` — who *you* are in the fleet: short id, session id, display name, working directory, and whether other agents can reach you (`addressable`). Read from the environment your own session gave this server, so it is you, not a guess — use it to tell a peer how to reach you, or to recognise yourself in `list_sessions`
+- `send_message` — write to another agent or to an MCP client's mailbox. To a session it is the same delivery path as `submit_prompt`, but the text arrives wrapped in an envelope naming the sender and its return address, so the recipient knows it is talking to a peer and can answer with a message of its own instead of replying into its own session where nobody sees it. To a mailbox it is stored until the client reads it. The sender is not a parameter — it is read from the environment this server process was started with, so it cannot be spoofed. Returns JSON with the message `id` and a `status` (`delivered` / `queued` / `failed` with a reason); `idempotency_key` makes a retried call return the first message instead of delivering twice. A session recipient mid-turn queues the message instead of being interrupted; a not-running-but-resumable one is resumed in place first (`resume=false` refuses instead, reporting the message as undelivered); a name matching several recipients is refused with the candidates listed rather than delivered to the first match. See [Agents writing to each other](#agents-writing-to-each-other) and [Mailboxes](#mailboxes-mcp-clients-as-recipients)
+- `message_status` — what became of a message by id: `queued`, `delivered`, `read` or `failed` with a reason, plus sender and recipient. Live for a mailbox recipient; fixed at delivery for a session, which gives no read receipt
+- `whoami` — who *you* are: `kind` `session` (short id, session id, display name, working directory) or `client` (the `mailbox` you read), and whether other agents can reach you (`addressable`). Read from the environment your own process gave this server, so it is you, not a guess — use it to tell a peer how to reach you, or to recognise yourself in `list_sessions`
+
+A client's mailbox (Codex, or any MCP client that is not a Claude Code session):
+
+- `read_messages` — your mailbox: without a cursor, what no reader has fetched yet (marked delivered, handed out once even with several readers); with a cursor, a replay of everything after it, changing nothing. Every message carries `untrusted: true`
+- `wait_for_messages` — the same, but blocking until at least one message is there or `timeout_seconds` passes (default 30, maximum 300), returning `timed_out: true` and no messages on a quiet mailbox — an ordinary result, not an error. Other tool calls on the same connection are served while it waits
+- `ack_messages` — acknowledge through a cursor: those messages become `read` for the sender's `message_status`
+- `register_mailbox` — give this client a name once, when `CLAUDE_AGENTS_MAILBOX` is not set in its environment
+- `list_mailboxes` — every mailbox with its counters (`total`, `queued`, `unread`, watermarks); the address book next to `list_sessions`. Does not expose message text
 
 ## Sessions that dropped off the list
 
@@ -167,7 +206,61 @@ The return address is the sender's short id, not its display name: names are not
 
 **Delivered is not read.** The call returns when the message has landed in the recipient's conversation, not when it has been read, acted on or answered. Replies arrive later as messages of their own — or not at all. Nothing blocks.
 
-**No second channel.** The message travels over `op:reply`, the daemon control-socket op the `claude` CLI itself uses to hand text to a background session, via the same `SubmitPrompt` that every other delivery here goes through (PTY fallback, verification and all). Recent Claude Code versions do have their own cross-session inbox (`CLAUDE_CODE_MESSAGING_SOCKET`, a per-worker socket under `/tmp/cc-socks`) behind the agent-teams flag; this server deliberately does not speak that undocumented protocol — and it reaches sessions that one does not, since only this path can wake a session that is not running.
+**No second channel.** The message travels over `op:reply`, the daemon control-socket op the `claude` CLI itself uses to hand text to a background session, via the same `SubmitPrompt` that every other delivery here goes through (PTY fallback, verification and all). Claude Code has its own cross-session messaging — see [Claude Code's SendMessage, for comparison](#claude-codes-sendmessage-for-comparison) — and this server deliberately does not speak that undocumented protocol: it reaches sessions that one does not (only this path can wake a session that is not running), and it reaches recipients that are not Claude Code sessions at all.
+
+**The text is untrusted, and the envelope says so.** A message is a peer's words — or an MCP client relaying someone's chat — and the envelope tells the recipient exactly that: not its user, not an approval, information to weigh against its own task and operator. The same marking travels with every message a mailbox hands out (`untrusted: true`, repeated in the result's note), because a model decides on the payload in front of it, not on a tool description it read an hour ago.
+
+## Mailboxes: MCP clients as recipients
+
+A Claude Code session receives a message in its conversation: the envelope is submitted as a turn, the agent reads it and acts. An MCP client such as Codex has no conversation anyone can submit into — it calls tools and reads results — so for it a message has to sit somewhere until it asks. That somewhere is a **mailbox**: a named inbox on disk that any server process can append to and that the client's own server process reads.
+
+**Address.** A mailbox is addressed by its name, `codex`, in the same `to` field as a session's short id or display name; `list_mailboxes` and `list_sessions` together are the address book. Resolution goes short id → session id → name (mailbox or display name) → id prefix, and a mailbox sharing a name with a session is reported as ambiguous rather than preferred — the same rule that refuses two sessions called `reviewer`. Mailbox names are lowercase, up to 32 characters, and may not look like a short id.
+
+**Identity.** The client's own identity is read from its server process's environment: `CLAUDE_AGENTS_MAILBOX=codex` in the MCP server configuration, or the default `register_mailbox` wrote once. It is not a parameter of `read_messages`, for the same reason the sender of `send_message` is not: a name you can claim per call is a name anyone can claim. The mailbox is created the moment a server process with that identity starts, so agents can write to it before Codex has read anything.
+
+**Cursor.** Every message in a mailbox has a sequence number; a cursor is one of those, as a string. A read without a cursor returns what no reader has fetched yet and moves the mailbox's *delivered* watermark past it — each message is handed out exactly once, however many Codex processes poll the same mailbox, because the watermark moves under a lock. A read with a cursor returns everything after it and moves nothing: that is the replay, for a reader that remembers where it was or wants to see something again. `pending` in the result counts what the `limit` left behind; `cursor` is where to continue from, and what `ack_messages` takes.
+
+**Statuses.** The same four words for every recipient kind, so a sender never has to know what it wrote to:
+
+| status | session recipient | mailbox recipient |
+| --- | --- | --- |
+| `queued` | in the recipient's input box behind the turn it is running; consumed when that turn ends | stored, not yet fetched by the client |
+| `delivered` | in the recipient's conversation — confirmed against its transcript | fetched by `read_messages` / `wait_for_messages` |
+| `read` | never: a session gives no read receipt | acknowledged with `ack_messages` |
+| `failed` | not delivered; the reason says why | the append failed; the reason says why |
+
+`send_message` returns the status it reached; `message_status` returns the current one by id. A mailbox status is derived from where the message's sequence number falls against the delivered and read watermarks, so nothing is ever rewritten in the log.
+
+**Idempotency.** Message ids are minted by the server (`m-` plus 48 random bits). A sender that may retry passes `idempotency_key` — any token of its own, scoped to the sender, so two agents can both use `1`; a repeated key returns the first message's record with `duplicate: true` and delivers nothing. The mailbox log is idempotent on the message id as well, and concurrent appends from different processes take the mailbox lock, so a message is never stored under two sequence numbers and two senders never share one.
+
+**Waiting.** `wait_for_messages` is a long-poll: the server watches the mailbox log and returns as soon as a message is there, or at the timeout with `timed_out: true` and an empty list. It is an ordinary tool call, so it works in every MCP client; the client decides how long to block (default 30 s, cap 300 s, see [Use with Codex](#use-with-codex) for why that cap). While one call waits, other tool calls on the same stdio connection are served — the server runs tool calls on a worker pool rather than on its read loop — so a long-poll does not stall a `list_sessions` issued next to it.
+
+**Storage.** Everything lives under `~/.claude/claude-agents-mcp/` (override with `CLAUDE_AGENTS_MCP_STATE_DIR`): `mailboxes/<name>/log.jsonl` (the append-only message log), `mailboxes/<name>/state.json` (the two watermarks), `sent/<id>.json` (the ledger `message_status` reads) and `sent/keys/` (idempotency keys). It is a filesystem store on purpose: there is no daemon of this server's own — Codex starts one process, every Claude session starts another — so state has to be shared through disk and has to survive all of them restarting. Writers take a `mkdir` lock per mailbox (the same lock the agents view uses for its pin file); a torn trailing line left by a crashed writer is repaired before the next append. Logs are not rotated; a mailbox that has seen thousands of messages still reads in milliseconds, and the directory can be deleted when it is no longer wanted.
+
+### Where automatic wake-up ends
+
+A message to a **session** wakes it: the envelope is submitted as a turn, exactly as a prompt is. That is the whole reason the session path exists.
+
+A message to a **mailbox does not wake anything**. It waits until the client asks. For Codex this is not a limitation of this server but of the client, verified in Codex's own sources (as of October 2026):
+
+- Codex's MCP client logs every server-initiated notification and does nothing else with it: `on_resource_updated`, `on_resource_list_changed`, `on_tool_list_changed`, `on_logging_message` and `on_progress` in `codex-rs/rmcp-client/src/logging_client_handler.rs` are `tracing` calls, and `ElicitationClientService::handle_notification` delegates everything but cancellations to that handler. No notification starts a model turn. Open issues openai/codex#15299, #17543 and #47193 ask for exactly that and are unanswered; PR #12449 (handling `tools/list_changed`) was closed unmerged.
+- Codex does not send `resources/subscribe` (nothing in `rmcp-client` does; only the conformance test server mentions it), so this server does not advertise the subscribe capability. Codex does expose `list_mcp_resources` and `read_mcp_resource` to its model, which are pull, like tools.
+- Codex supports MCP elicitation, but an elicitation is a dialog to the *user*, not a turn for the model; sampling is not implemented.
+- The CLI, the desktop app and voice mode share one MCP client (`codex-rs/codex-mcp` + `rmcp-client`), so none of them differs here.
+
+So the only way a message reaches a Codex model is a tool call the model makes: `wait_for_messages` in a loop, or `read_messages` when it thinks of it. Waking a Codex chat or voice session from outside would need a bridge on Codex's side — a process that owns a `codex app-server` and calls `turn/start` or `turn/steer` on a thread it holds — and that is a separate piece of software, not something this server can do or promise. The `notify` hook and the newer `hooks` only run commands *out of* Codex when its turns end; nothing in Codex's configuration runs anything into a live conversation.
+
+For Claude Code sessions the same split holds: a Claude session reads a mailbox only if told to poll one; it is woken by a message to its *session*.
+
+### Claude Code's SendMessage, for comparison
+
+Claude Code has cross-session messaging of its own (`SendMessage` / `ListAgents`, behind `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`; documented at <https://code.claude.com/docs/en/cross-session-messaging>), and this server's envelope borrows its shape. What was verified on this machine (Claude Code 2.1.289, by reading the installed binary's strings and the files it writes):
+
+- **Transport: a unix socket per session, pushed into the process.** Every session listens on `/tmp/cc-socks/<pid>.sock` (`srw-------`), announced to its own processes as `CLAUDE_CODE_MESSAGING_SOCKET`, with a per-session `CLAUDE_CODE_MESSAGING_TOKEN` the sender must present first. The protocol is newline-delimited JSON — an `{"type":"auth","token":…}` frame, then `{"type":"user","message":{"role":"user","content":…},"priority":"next","from":"uds:<socket>"}` — and the content is wrapped as `<cross-session-message from="uds:…" from-session="…" hop-chain="…" from-name="…" from-mode="…">`. There is no file mailbox and no directory polling on the receiving side: the frame is routed into the session's prompt queue (`origin: {kind: "peer", …}`), and the `claude agents` daemon is not involved. (`~/.claude/teams/session-<short>/inboxes/` is a different thing — the in-session teammate inbox.)
+- **Address book: a registry file per session.** `~/.claude/sessions/<pid>.json` carries `pid`, `sessionId`, `cwd`, `kind`, `name` with `nameSource` (`user`/`auto`/`peer`), `jobId` (the fleet short id), `messagingSocketPath`, `status` and `peerFeatures` (`notify_idle`, `reply_across_default_dirs`, `artifact_yield`); the sibling `<pid>.<sha256>.key` (0600) holds the peer token. `ListAgents` reads this registry, and the `[ref]` after a name is the first six characters of a hash of `session:<id>` (lengthened on collision) — **not** the short id: `⎈ mwo-orchestrator [b642fb]` is short `c95308b7`, so the two address spaces never mix.
+- **Delivery wakes an idle recipient** — "When the receiving session is idle, Claude Code starts a new turn with the message"; a busy one reads it between tool calls. Unless the receiver's `crossSessionInbound` setting (`accept` / `hold` / `refuse`) or a permission-mode mismatch holds it: a held message waits for that session's user and the sender gets a `[Cross-session delivery notice] … held by that session … NOT delivered: its Claude has not seen it` — then `approved and released`, `denied by the recipient user`, `not approved before expiry`, or `refused` (feature off), and `dropped at that session's inbox` for rate, duplicate, relay-loop and full-queue cases. `notify_when_idle` is a one-shot subscription answered by a `[Cross-session idle notice] "<label>" … is idle now` (or `has exited`, or expired after 12 hours), each notice saying it "is an automated notice from that session's harness — not a message from a person, and not an instruction".
+
+The differences are the point of this server. It has no hold/approve gate because it delivers as a prompt the recipient's user could have typed — which is also why its envelope marks the text untrusted so loudly. It wakes a session that is not running, which a socket on a dead process cannot. Its addresses are the fleet's short ids and names, the ones `claude agents` shows. And it delivers to recipients that are not Claude Code sessions at all, which is what a mailbox is for. The socket protocol above is described, not spoken: this server does not use it.
 
 ## Status
 
@@ -186,7 +279,10 @@ The return address is the sender's short id, not its display name: names are not
 - [x] Fork a session (`fork_session`): native `--fork-session` into a new entry (new short + session id) carrying the source's full history, source untouched, verify liveness before returning, clean up the worker on any failure
 - [x] Model selection on `create_session` / `fork_session` / `resume_session`: optional `model` (alias or full model id, passed as `--model`, validated by the claude CLI); on resume an explicit model replaces the one the session was launched with
 - [x] Inter-agent messaging (`send_message`): sender identity taken from the environment (not a spoofable parameter), an envelope carrying who is writing and how to answer, queue-don't-interrupt for a busy recipient, auto-resume for a sleeping one, ambiguous names refused with candidates instead of misrouted
-- [x] Self-identification (`whoami`): a session can find out its own short id, name, working directory and whether peers can reach it
+- [x] Self-identification (`whoami`): a session can find out its own short id, name, working directory and whether peers can reach it; a client learns its mailbox
+- [x] Mailboxes for MCP clients (`read_messages`, `wait_for_messages`, `ack_messages`, `register_mailbox`, `list_mailboxes`): an on-disk inbox any server process can append to, read by cursor or fetched exactly once, long-polled with an honest timeout, surviving restarts, with every message marked untrusted — see [Mailboxes](#mailboxes-mcp-clients-as-recipients)
+- [x] Delivery statuses and a sent ledger (`message_status`): `queued` / `delivered` / `read` / `failed` with a reason, by message id; idempotency keys so a retried send never delivers twice
+- [x] Concurrent tool calls over stdio (mcp-go v1.1.1 worker pool), so a long-poll does not stall other calls
 - [x] Rename a session (`ctrl+r`; custom title via `.meta.json` sidecar)
 - [x] Pin / unpin a session (`ctrl+t`; agents-view pin set in `~/.claude/jobs/pins.json`)
 - [x] Reorder a session up/down or to an absolute slot (`shift+↑/↓`; sort keys in `~/.claude/jobs/<id>/order`)
@@ -202,10 +298,12 @@ The return address is the sender's short id, not its display name: names are not
 ### Not yet — wanted
 
 - [ ] Full VT terminal emulation for `read_screen` (today it ANSI-strips the PTY tail, so wrapped/redrawn TUI screens render imperfectly — not a true cell grid)
-- [ ] Live streaming / subscribe tool (push updates as a session changes; today `read_screen` is a pull/snapshot)
+- [ ] Live streaming / subscribe tool (push updates as a session changes; today `read_screen` is a pull/snapshot, and no MCP client in use here acts on a server notification anyway)
 - [ ] Structured detection of permission prompts + a high-level "answer the prompt" tool (the resume dialog is recognised and answerable today; permission prompts are only reported as an unknown dialog)
 - [ ] High-level "answer the session's `needs` question" tool
-- [ ] Read receipts and threading for `send_message` (today a message is confirmed as landed in the recipient's conversation; there is no signal that it was read, and a reply is tied to what it answers only by the message id the recipient quotes)
+- [ ] Read receipts from sessions and threading for `send_message` (a mailbox recipient reports `read`; a session only `delivered`, and a reply is tied to what it answers only by the message id the recipient quotes)
+- [ ] Pushing a mailbox message into a running Codex conversation — needs a bridge on Codex's side (`codex app-server` + `turn/start`), see [Where automatic wake-up ends](#where-automatic-wake-up-ends)
+- [ ] Mailbox log rotation
 - [ ] Broadcast: one message to several recipients, or to a named group (today each recipient is a separate call)
 - [ ] Real-time bidirectional interactive bridge (hand a live session to a human/agent)
 - [ ] Rename reflected in the live daemon roster `name` (today it sets the custom title; the roster name stays the spawn name)
@@ -219,7 +317,9 @@ The return address is the sender's short id, not its display name: names are not
 - create / stop / remove shell out to the stable public `claude` CLI.
 - resume goes through the daemon, not the CLI. `claude --bg --resume` is the wrong tool here: it forks the session — spawning a worker under a fresh short with a new session id and leaving the original as a duplicate not-running entry — and it crashes deterministically (the daemon does not retry) when the session has no transcript ("No conversation found") or its saved cwd is gone ("working directory no longer exists", e.g. a deleted worktree). Instead `resume_session` does exactly what pressing Enter on a session in the agents view does: it sends the daemon an `op:dispatch` with `launch.mode:"resume"` under the session's **own** short, so the session simply goes live in place (same id, single entry). It reconstructs the dispatch descriptor from the session's on-disk job state (`~/.claude/jobs/<short>/state.json`) and authenticates with the daemon control key, validates the saved cwd up front, polls the roster until the worker holds a usable state, and stops the worker on any failure so no crashed/idle session is left behind. Sessions with no on-disk job state (no longer in the agents list) fall back to the CLI resume.
 - the dispatch descriptor must carry `launch.transcriptPath`. The resumed worker's `--resume <sessionId>` lookup only searches the project directory derived from the launch `cwd` (`~/.claude/projects/<sanitized-cwd>/`), so a session whose transcript lives under a different project dir — typically one that switched into a worktree mid-run — exits at startup with "No conversation found" (`exit 1`, `exit_with_message`) and crash-loops, even though the same session resumes fine from the agents view. The picker avoids this by passing the transcript path explicitly in the descriptor; `resume_session` derives the same path from the job state's `linkScanPath` (falling back to a `~/.claude/projects/*/<sessionId>.jsonl` search) and omits it only when no transcript exists yet.
-- `send_message` adds no channel of its own: it renders the envelope and hands it to the same `SubmitPrompt` used for every other delivery (daemon `op:reply`, PTY fallback, transcript verification). What it adds is identity — the sender is read from the environment Claude Code gives this server process (`CLAUDE_CODE_SESSION_ID`, and `CLAUDE_JOB_DIR`, whose base name is the short id), which is also what `whoami` reports, so it is neither a parameter nor a guess.
+- `send_message` to a session adds no channel of its own: it renders the envelope and hands it to the same `SubmitPrompt` used for every other delivery (daemon `op:reply`, PTY fallback, transcript verification). What it adds is identity — the sender is read from the environment the client gives this server process (`CLAUDE_CODE_SESSION_ID` and `CLAUDE_JOB_DIR`, whose base name is the short id, for a Claude Code session; `CLAUDE_AGENTS_MAILBOX` for an MCP client), which is also what `whoami` reports, so it is neither a parameter nor a guess.
+- `send_message` to a mailbox appends to `~/.claude/claude-agents-mcp/mailboxes/<name>/log.jsonl` under a per-mailbox `mkdir` lock; reads derive each message's status from the watermarks in the sibling `state.json`. `wait_for_messages` polls the log's size every 200 ms and re-reads only when it changed. Every `send_message` also writes `sent/<id>.json`, which is what `message_status` and the idempotency check read.
+- the stdio transport serves tool calls on a worker pool (mcp-go v1.1.1), so a blocking `wait_for_messages` does not hold up other calls from the same client; the pinned v0.32.0 handled requests one at a time on its read loop.
 - pin / reorder are **not** daemon ops — the agents-view picker keeps them on disk under `~/.claude/jobs`: the pin set in `pins.json` (a JSON array of short ids, written under a lock) and per-session sort keys in `<id>/order` and `<id>/stateOrder`. `pin_session` / `reorder_session` write exactly those files, so the change is durable and any picker reflects it.
 
 Slash commands only work over the raw PTY (`op:attach`): they are REPL input, not conversation messages, so they cannot be delivered through any message/dispatch channel.
