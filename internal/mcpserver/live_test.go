@@ -131,14 +131,15 @@ func TestLiveSmoke(t *testing.T) {
 	waitIdle(t, ctx, call, target)
 }
 
-// waitIdle blocks until the target session has produced no output for a while,
-// so the next delivery lands at its prompt rather than queueing. It goes by the
-// daemon-observed tempo, not by state: state is what the agent reports about
-// itself ("working", "waiting for …") and an idle agent may well say it is
-// working on waiting.
+// waitIdle gives the target session a moment to settle before the next
+// delivery, going by the daemon-observed tempo. It is best-effort and bounded:
+// tempo reads "active" whenever the TUI repainted recently — the status bar
+// alone does that — and state is what the agent reports about itself, so an
+// idle session can look busy by both measures. SubmitPrompt handles a
+// genuinely running turn (the message queues); this only avoids racing a boot.
 func waitIdle(t *testing.T, ctx context.Context, call func(context.Context, string, map[string]any) (string, bool, error), target string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Minute)
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		raw, _, err := call(ctx, "get_session", map[string]any{"session": target})
 		var s agents.Session
@@ -146,7 +147,8 @@ func waitIdle(t *testing.T, ctx context.Context, call func(context.Context, stri
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("session %s never went idle: %s", target, raw)
+			t.Logf("session %s still reports tempo=active after 30s; proceeding (the delivery path copes with a running turn)", target)
+			return
 		}
 		time.Sleep(time.Second)
 	}
@@ -182,17 +184,19 @@ func TestLiveRoundTrip(t *testing.T) {
 	}()
 	time.Sleep(500 * time.Millisecond)
 	start := time.Now()
-	if raw, isErr, err := call(ctx, "list_mailboxes", nil); err != nil || isErr || !strings.Contains(raw, liveMailbox) {
+	raw, isErr, err = call(ctx, "list_mailboxes", nil)
+	listElapsed := time.Since(start)
+	if err != nil || isErr || !strings.Contains(raw, liveMailbox) {
 		t.Fatalf("list_mailboxes during a wait: %v / %s", err, raw)
 	}
-	if el := time.Since(start); el > 3*time.Second {
-		t.Fatalf("list_mailboxes took %s while a wait_for_messages was in flight — stdio is serialising tool calls", el)
+	if listElapsed > 3*time.Second {
+		t.Fatalf("list_mailboxes took %s while a wait_for_messages was in flight — stdio is serialising tool calls", listElapsed)
 	}
 	wg.Wait()
 	if waitElapsed < 5*time.Second {
 		t.Fatalf("the concurrent wait returned after %s, before its timeout", waitElapsed)
 	}
-	t.Logf("concurrency: list_mailboxes answered in %s while wait_for_messages ran for %s", time.Since(start), waitElapsed)
+	t.Logf("concurrency: list_mailboxes answered in %s while wait_for_messages ran for %s", listElapsed, waitElapsed)
 
 	// Drain anything a previous run left in the mailbox so the pong we wait for
 	// is ours.
