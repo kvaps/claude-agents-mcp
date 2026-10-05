@@ -345,3 +345,9 @@ func (c *Client) Snapshot(short string, tail int) (Session, string, error) {
 	}
 	return Session{}, "", fmt.Errorf("no snapshot received for %s", short)
 }
+
+// NewTestClient returns a client whose address book is the given function
+// instead of the daemon and CLI, so messaging can be tested without either.
+// Everything that needs a live session (delivery to one, resume) still needs
+// the daemon; only resolution and identity are redirected.
+func NewTestClient(list func() ([]Session, error)) *Client { return &Client{listFn: list} }
