@@ -46,9 +46,14 @@ func pinsPath() (string, error) {
 // a concurrently-running picker. A lock whose mtime is older than the stale
 // window is assumed abandoned and stolen.
 func acquireLock(target string) (release func(), err error) {
+	return acquireLockWait(target, 3*time.Second)
+}
+
+// acquireLockWait is acquireLock with a caller-chosen bound on the wait.
+func acquireLockWait(target string, wait time.Duration) (release func(), err error) {
 	lock := target + ".lock"
 	const stale = 10 * time.Second
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(wait)
 	for {
 		if mkErr := os.Mkdir(lock, 0o700); mkErr == nil {
 			return func() { _ = os.Remove(lock) }, nil
