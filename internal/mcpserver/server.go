@@ -62,14 +62,29 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		mcp.WithBoolean("dangerous", mcp.Description("pass --dangerously-skip-permissions")),
 		mcp.WithString("prompt", mcp.Description("task to deliver and submit once the session is up (may be long/multi-line)")),
 		mcp.WithBoolean("goal", mcp.Description("submit the prompt as a /goal command")),
+		mcp.WithBoolean("trust_workspace", mcp.Description("before launching, record Claude Code's workspace trust for cwd's project (its repository root, or cwd outside a repository), as accepting the trust dialog there would. Only allowed when that project lies inside a folder the server's operator listed in CLAUDE_AGENTS_TRUST_ROOTS; refused otherwise. Trusting a folder lets its project settings, hooks and MCP servers load.")),
 	), func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		out, err := agents.Create(r.GetString("cwd", ""), r.GetString("name", ""), r.GetString("model", ""), r.GetBool("dangerous", false))
+		cwd := r.GetString("cwd", "")
+		trusted := ""
+		if r.GetBool("trust_workspace", false) {
+			res, err := agents.PreTrust(cwd)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			if !res.Already {
+				trusted = "\ntrusted workspace " + res.Project
+			}
+		}
+		out, err := agents.Create(cwd, r.GetString("name", ""), r.GetString("model", ""), r.GetBool("dangerous", false))
 		if err != nil {
+			if strings.Contains(err.Error(), "Workspace not trusted") {
+				return mcp.NewToolResultError(err.Error() + "\n\ntrust_workspace=true records the trust instead, if the server's operator allows it for this folder (CLAUDE_AGENTS_TRUST_ROOTS)."), nil
+			}
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		prompt := r.GetString("prompt", "")
 		if strings.TrimSpace(prompt) == "" {
-			return mcp.NewToolResultText("created: " + out), nil
+			return mcp.NewToolResultText("created: " + out + trusted), nil
 		}
 		short := agents.ParseShortID(out)
 		if short == "" {
@@ -82,7 +97,7 @@ func New(version string, a *agents.Client) *server.MCPServer {
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("created %s but %v", short, err)), nil
 		}
-		return mcp.NewToolResultText(fmt.Sprintf("created %s and started the task — %s", short, how)), nil
+		return mcp.NewToolResultText(fmt.Sprintf("created %s and started the task — %s%s", short, how, trusted)), nil
 	})
 
 	s.AddTool(mcp.NewTool("resume_session",
