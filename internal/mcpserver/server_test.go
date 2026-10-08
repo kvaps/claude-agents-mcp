@@ -244,3 +244,26 @@ func TestRegisterMailboxOverMCP(t *testing.T) {
 		t.Fatalf("hex name accepted: %s", raw)
 	}
 }
+
+// TestCreateSessionTrustNeedsTheOperator: trust_workspace is refused, before
+// anything is launched, unless the operator's trust roots cover the folder.
+func TestCreateSessionTrustNeedsTheOperator(t *testing.T) {
+	t.Setenv("CLAUDE_AGENTS_MCP_STATE_DIR", t.TempDir())
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("CLAUDE_CONFIG_DIR", dir)
+	t.Setenv("PATH", "") // a launch attempt would fail differently: no claude CLI
+	asClient(t, "codex")
+	call := newServer(t)
+
+	t.Setenv("CLAUDE_AGENTS_TRUST_ROOTS", "")
+	raw, isErr := call("create_session", map[string]any{"cwd": dir, "trust_workspace": true})
+	if !isErr || !strings.Contains(raw, "CLAUDE_AGENTS_TRUST_ROOTS") || strings.Contains(raw, "claude CLI") {
+		t.Fatalf("without trust roots: %s (err=%v)", raw, isErr)
+	}
+	t.Setenv("CLAUDE_AGENTS_TRUST_ROOTS", t.TempDir())
+	raw, isErr = call("create_session", map[string]any{"cwd": dir, "trust_workspace": true})
+	if !isErr || !strings.Contains(raw, "not inside") {
+		t.Fatalf("outside the trust roots: %s (err=%v)", raw, isErr)
+	}
+}
