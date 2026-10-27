@@ -3,6 +3,8 @@ package agents
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -84,6 +86,10 @@ func (c *Client) WaitInteractive(short string, timeout time.Duration) error {
 // baseline captured just before submitting. A normal conversational turn keeps
 // state=="done" and only flips tempo to "active" and updates detail (state only
 // reads "working" for goal/loop sessions), so any of those signals counts.
+//
+// It is weak evidence — tempo flips on any repaint, including the one the text
+// landing in the input box causes — so it is only consulted for a session whose
+// transcript cannot be located at all.
 func turnStarted(base, cur Session) bool {
 	return cur.Busy() ||
 		cur.Detail != base.Detail ||
@@ -92,12 +98,13 @@ func turnStarted(base, cur Session) bool {
 }
 
 // delivery is the evidence baseline for one prompt delivery, captured before the
-// text is sent: the session's roster state (for the TUI heuristics) and the byte
-// offsets of its transcripts (for ground truth).
+// text is sent: the session's roster state (for the TUI heuristics), the byte
+// offsets of its transcripts (for ground truth) and when it was sent.
 type delivery struct {
 	base Session
 	mark transcriptMark
 	body string
+	at   time.Time
 }
 
 // beginDelivery snapshots the baseline a delivery is later judged against. It
@@ -106,19 +113,25 @@ type delivery struct {
 // state and hide the very change we look for.
 func (c *Client) beginDelivery(short, body string) delivery {
 	base, _ := c.Resolve(short)
-	return delivery{base: base, mark: markTranscript(base.SessionID), body: body}
+	return delivery{base: base, mark: markTranscript(base.SessionID), body: body, at: time.Now()}
 }
 
-// Confirmations returned by delivered/waitDelivered, reported up to the caller so
-// a success is honest about what it is based on.
+// Confirmations returned by SubmitPrompt, reported up to the caller so a success
+// is honest about what it is based on.
 const (
 	// confirmedTranscript: the prompt was found as a user record in the session
 	// transcript. This is ground truth — the text reached the conversation.
 	confirmedTranscript = "prompt confirmed in the session transcript"
-	// confirmedState: the roster state changed as a turn starting would, but the
-	// transcript did not (yet) show the prompt. Weaker evidence: it says the
-	// session started doing something, not that it was our text.
-	confirmedState = "turn started (roster state only; not confirmed against the transcript)"
+	// confirmedUnrecorded: the prompt left the input box and the session is
+	// working, but the CLI had not written it to the transcript by the end of
+	// the confirmation window. The CLI records a prompt only after processing it
+	// (hooks, attachments) and flushes on a timer, so a loaded machine can
+	// take longer than the window. Treated as delivered.
+	confirmedUnrecorded = "prompt submitted and the session is working on it, but it was not in the session transcript yet when the confirmation window ran out — treat it as delivered: do not resubmit (that would deliver it twice); get_session or read_screen if in doubt"
+	// confirmedState: the session's transcript could not be located (no session
+	// id), so the only evidence is the roster changing as a turn starting would.
+	// It says the session started doing something, not that it was our text.
+	confirmedState = "turn started (roster state only; the session's transcript could not be located to confirm against)"
 	// confirmedQueued: the session was already running a turn, so the prompt is
 	// sitting in the input box and the REPL will consume it when that turn ends.
 	// This is a success, not a failure, and it specifically must not be retried:
@@ -126,13 +139,85 @@ const (
 	confirmedQueued = "prompt queued behind the turn the session is already running; it will be consumed when that turn ends — do not retry and do not send Enter (either would deliver it twice or interrupt the running turn)"
 )
 
+// errNotDelivered is returned when, at the end of the confirmation window,
+// nothing shows the prompt was taken: it is not in the transcript or the CLI's
+// queue, the input box does not hold it, and the session is not working.
+var errNotDelivered = errors.New("prompt not delivered: it is not in the session transcript, the input box does not hold it, and the session is not working. Enter was not the problem. read_screen before resubmitting — if the screen shows the prompt being worked on after all, it was delivered and resubmitting would deliver it twice")
+
+// Default timings for confirming a delivery against the transcript.
+const (
+	// defaultConfirmWindow bounds the whole wait for the prompt to appear in
+	// the transcript, from the moment it was sent. CLAUDE_AGENTS_CONFIRM_TIMEOUT
+	// overrides it.
+	defaultConfirmWindow = 15 * time.Second
+	// rescueAfter is how long the transcript is given before the session is
+	// inspected for text stuck unsubmitted in its input box.
+	rescueAfter = 4 * time.Second
+	// enterWait is how long the transcript is given after each rescue Enter.
+	enterWait = 6 * time.Second
+)
+
+// confirmTimeoutEnv names the variable that overrides defaultConfirmWindow: a Go
+// duration ("20s") or a whole number of seconds, clamped to 1s–120s.
+const confirmTimeoutEnv = "CLAUDE_AGENTS_CONFIRM_TIMEOUT"
+
+// confirmTimings are the waits one delivery is confirmed within.
+type confirmTimings struct {
+	window, rescue, enter time.Duration
+}
+
+// timings returns the client's confirmation waits: the test override where one
+// is set, the defaults and the environment otherwise.
+func (c *Client) timings() confirmTimings {
+	t := c.confirm
+	if t.window == 0 {
+		t.window = confirmWindowFromEnv()
+	}
+	if t.rescue == 0 {
+		t.rescue = rescueAfter
+	}
+	if t.enter == 0 {
+		t.enter = enterWait
+	}
+	t.rescue = min(t.rescue, t.window)
+	return t
+}
+
+func confirmWindowFromEnv() time.Duration {
+	v := strings.TrimSpace(os.Getenv(confirmTimeoutEnv))
+	if v == "" {
+		return defaultConfirmWindow
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		n, nerr := strconv.Atoi(v)
+		if nerr != nil {
+			return defaultConfirmWindow
+		}
+		d = time.Duration(n) * time.Second
+	}
+	return min(max(d, time.Second), 2*time.Minute)
+}
+
 // delivered reports how, if at all, the prompt has been confirmed as landed.
-// The transcript is checked first because it is the only signal that identifies
-// *our* text; the roster heuristic is the fallback for sessions whose transcript
-// cannot be located (no session id yet, or a never-prompted session).
-func (c *Client) delivered(short string, d delivery) string {
-	if d.mark.Landed(d.body) {
-		return confirmedTranscript
+//
+// Wherever the transcript can be located it is the only thing consulted: it is
+// the one signal that identifies *our* text, and the roster changes before the
+// CLI writes the prompt down, so letting the roster answer first would turn
+// most confirmations into roster-only ones. The roster heuristic is the
+// fallback for a session whose transcript cannot be located at all.
+func (c *Client) delivered(short string, d *delivery) string {
+	if !d.mark.available() {
+		// A session that had no session id at the baseline may have one now.
+		if cur, err := c.Resolve(short); err == nil && cur.SessionID != "" {
+			d.mark.adopt(cur.SessionID, d.at)
+		}
+	}
+	if d.mark.available() {
+		if d.mark.Landed(d.body) {
+			return confirmedTranscript
+		}
+		return ""
 	}
 	if cur, err := c.Resolve(short); err == nil && turnStarted(d.base, cur) {
 		return confirmedState
@@ -140,19 +225,108 @@ func (c *Client) delivered(short string, d delivery) string {
 	return ""
 }
 
-// waitDelivered polls until the prompt is confirmed as landed, or timeout. It
-// returns the confirmation, or "" if none was reached.
-func (c *Client) waitDelivered(short string, d delivery, timeout time.Duration) string {
+// waitDelivered polls until the prompt is confirmed as landed, or timeout,
+// backing off from 100ms to 1s between reads. It returns the confirmation, or ""
+// if none was reached.
+func (c *Client) waitDelivered(short string, d *delivery, timeout time.Duration) string {
 	deadline := time.Now().Add(timeout)
+	pause := 100 * time.Millisecond
 	for {
 		if how := c.delivered(short, d); how != "" {
 			return how
 		}
-		if time.Now().After(deadline) {
+		left := time.Until(deadline)
+		if left <= 0 {
 			return ""
 		}
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(min(pause, left))
+		pause = min(pause*3/2, time.Second)
 	}
+}
+
+// sessionState is what can be seen of a delivery that the transcript has not
+// confirmed: the transcript since the mark, the screen and the roster.
+type sessionState struct {
+	scan    transcriptScan
+	pending bool // the input box still holds the prompt
+	working bool // the screen shows a turn running
+	busy    bool // the roster reports state=="working"
+	seen    bool // the screen could be read, so pending is known
+}
+
+// underway reports whether the prompt has evidently been taken: it is no longer
+// in the input box and the session is doing something with it. Roster detail
+// and tempo are left out on purpose — both change on a repaint alone.
+func (s sessionState) underway() bool {
+	return !s.pending && (s.working || s.busy || s.scan.Grew || s.scan.Enqueued)
+}
+
+func (c *Client) observe(short string, d delivery) sessionState {
+	st := sessionState{scan: d.mark.Scan(d.body)}
+	if cur, err := c.Resolve(short); err == nil {
+		st.busy = cur.Busy()
+	}
+	before, err := c.ReadScreen(short, 60)
+	if err != nil {
+		return st
+	}
+	time.Sleep(screenSampleGap)
+	after, err := c.ReadScreen(short, 60)
+	if err != nil {
+		return st
+	}
+	st.seen = true
+	st.pending = inputHolds(after, d.body)
+	st.working = strings.Contains(newOutput(before, after), "esc to interrupt")
+	return st
+}
+
+// screenSampleGap separates the two screen reads observe compares. A running
+// turn repaints its spinner several times a second; an idle session draws
+// nothing.
+const screenSampleGap = 600 * time.Millisecond
+
+// newOutput returns what the second of two reads of a session's output tail
+// added to the first. The tail is raw output, so a spinner from a turn that has
+// since ended can still be in it; only output that is still arriving says a
+// turn is running now.
+func newOutput(before, after string) string {
+	if before == after {
+		return ""
+	}
+	anchor := before[max(0, len(before)-200):]
+	if i := strings.LastIndex(after, anchor); anchor != "" && i >= 0 {
+		return after[i+len(anchor):]
+	}
+	return after
+}
+
+// inputHolds reports whether the input box on screen still holds the prompt.
+// The input box is drawn below the conversation, so the last line that starts
+// with the prompt marker is it; it holds the prompt when it shows the collapsed
+// "[Pasted text" placeholder or the start of the prompt's first line.
+func inputHolds(screen, body string) bool {
+	lines := strings.Split(normaliseScreen(screen), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		rest, ok := strings.CutPrefix(trimBox(lines[i]), "❯")
+		if !ok {
+			continue
+		}
+		rest = normaliseText(rest)
+		if rest == "" {
+			return false
+		}
+		if strings.Contains(rest, "[Pasted text") {
+			return true
+		}
+		first, _, _ := strings.Cut(strings.TrimSpace(body), "\n")
+		head := normaliseText(first)
+		if len(head) > 24 {
+			head = strings.ToValidUTF8(head[:24], "")
+		}
+		return head != "" && strings.HasPrefix(rest, head)
+	}
+	return false
 }
 
 // buildSubmitBody produces the exact text to deliver for a submission. A plain
@@ -215,10 +389,10 @@ func (c *Client) SubmitPrompt(short, text string, goal bool) (string, error) {
 	// Native op acked. Don't trust it: verify the prompt landed, and if it hasn't
 	// (the body is sitting as an unsubmitted paste), press Enter to submit it,
 	// retrying once before reporting failure.
-	if how := c.waitDelivered(short, d, 4*time.Second); how != "" {
+	if how := c.waitDelivered(short, &d, c.timings().rescue); how != "" {
 		return how, nil
 	}
-	return c.submitEnterUntilStarted(short, d)
+	return c.submitEnterUntilStarted(short, &d)
 }
 
 // submitEnterUntilStarted presses Enter to submit a prompt still sitting in the
@@ -242,22 +416,52 @@ func (c *Client) SubmitPrompt(short, text string, goal bool) (string, error) {
 // delivery can be in, and they want opposite responses: answer the dialog, wait
 // out the turn, or press Enter. Only the third is handled here by pressing a
 // key; the other two are reported so the caller does not have to guess.
-func (c *Client) submitEnterUntilStarted(short string, d delivery) (string, error) {
+//
+// A prompt that has already left the input box and is being worked on gets no
+// Enter either: it is only waiting to be written down. Whatever has not reached
+// the transcript by the end of the confirmation window is reported by
+// unconfirmed.
+func (c *Client) submitEnterUntilStarted(short string, d *delivery) (string, error) {
+	t := c.timings()
 	for attempt := 0; attempt < 2; attempt++ {
 		if dlg := c.dialogOnScreen(short); dlg.Blocking() {
 			return "", &DialogBlockedError{Dialog: dlg}
 		}
-		if c.midTurn(short, d) {
+		if c.midTurn(short, *d) {
 			return confirmedQueued, nil
+		}
+		if c.observe(short, *d).underway() {
+			break
 		}
 		if _, err := c.send(short, []byte("\r"), true, 800*time.Millisecond); err != nil {
 			return "", err
 		}
-		if how := c.waitDelivered(short, d, 6*time.Second); how != "" {
+		if how := c.waitDelivered(short, d, t.enter); how != "" {
 			return how, nil
 		}
 	}
-	return "", errNotStarted
+	if how := c.waitDelivered(short, d, time.Until(d.at.Add(t.window))); how != "" {
+		return how, nil
+	}
+	return c.unconfirmed(short, *d)
+}
+
+// unconfirmed classifies a delivery the transcript never confirmed within the
+// window. Each verdict asks the caller for something different: nothing
+// (queued, or delivered and not yet recorded), Enter having failed, or a
+// resubmission once the screen has been read.
+func (c *Client) unconfirmed(short string, d delivery) (string, error) {
+	st := c.observe(short, d)
+	switch {
+	case st.scan.Foreign || st.scan.Enqueued:
+		return confirmedQueued, nil
+	case st.underway():
+		return confirmedUnrecorded, nil
+	case st.pending || !st.seen:
+		return "", errNotStarted
+	default:
+		return "", errNotDelivered
+	}
 }
 
 // midTurn reports whether the session is busy running a turn that is not ours,
@@ -268,13 +472,14 @@ func (c *Client) submitEnterUntilStarted(short string, d delivery) (string, erro
 // tempo=="active" — indistinguishable from one that has just booted and is
 // sitting idle at its prompt. So activity is taken from the transcript instead:
 // a running turn appends assistant and tool records continuously, while an idle
-// session writes nothing. Growth without our prompt appearing means the session
-// is busy with something else.
+// session writes nothing. Conversation records appearing without our prompt
+// mean the session is busy with something else; other bookkeeping the CLI
+// writes at the start of our own turn does not count.
 func (c *Client) midTurn(short string, d delivery) bool {
 	if cur, err := c.Resolve(short); err == nil && cur.Busy() {
 		return true
 	}
-	return d.mark.Grew()
+	return d.mark.Scan(d.body).Foreign
 }
 
 // submitViaPTY is the keystroke-emulation fallback for SubmitPrompt: it types the
@@ -314,5 +519,5 @@ func (c *Client) submitViaPTY(short, body string) (string, error) {
 	time.Sleep(300 * time.Millisecond)
 	d := c.beginDelivery(short, body)
 
-	return c.submitEnterUntilStarted(short, d)
+	return c.submitEnterUntilStarted(short, &d)
 }

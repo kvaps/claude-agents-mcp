@@ -66,7 +66,7 @@ func TestSubmitPromptStartsTurnIntegration(t *testing.T) {
 			// Verify the prompt actually landed, independent of which path
 			// SubmitPrompt took (native op:reply or the PTY fallback), so the
 			// guarantee holds either way.
-			if c.waitDelivered(short, d, 8*time.Second) == "" {
+			if c.waitDelivered(short, &d, 8*time.Second) == "" {
 				t.Errorf("%s iter %d: SubmitPrompt reported %q but the prompt never landed", tc.name, i, how)
 				continue
 			}
