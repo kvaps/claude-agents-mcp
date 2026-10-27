@@ -32,6 +32,9 @@ func record(cwd, extra string) string {
 func TestFindOrphanByShortAndSessionID(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// The daemon's directory follows CLAUDE_CONFIG_DIR; clear it so the
+	// fixtures under the fake HOME are the ones resolved.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	cwd := t.TempDir()
 	const sid = "abcd1234-1111-2222-3333-444455556666"
 	writeTranscript(t, home, "-tmp-repo", sid,
@@ -66,6 +69,9 @@ func TestFindOrphanByShortAndSessionID(t *testing.T) {
 func TestFindOrphanRejectsVagueReferences(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// The daemon's directory follows CLAUDE_CONFIG_DIR; clear it so the
+	// fixtures under the fake HOME are the ones resolved.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	writeTranscript(t, home, "-tmp-repo", "abcd1234-1111-2222-3333-444455556666", record(t.TempDir(), ""))
 
 	for _, ref := range []string{"", "ab", "abcd", "abcd123", "some-session-name", "zzzzzzzz"} {
@@ -80,6 +86,9 @@ func TestFindOrphanRejectsVagueReferences(t *testing.T) {
 func TestFindOrphanPrefersFreshestTranscript(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// The daemon's directory follows CLAUDE_CONFIG_DIR; clear it so the
+	// fixtures under the fake HOME are the ones resolved.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	oldCwd, newCwd := t.TempDir(), t.TempDir()
 	const sid = "beef0000-1111-2222-3333-444455556666"
 	old := writeTranscript(t, home, "-tmp-old", sid, record(oldCwd, ""))
@@ -106,6 +115,9 @@ func TestFindOrphanPrefersFreshestTranscript(t *testing.T) {
 func TestOrphanCwdFallsBackToAnExistingDirectory(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// The daemon's directory follows CLAUDE_CONFIG_DIR; clear it so the
+	// fixtures under the fake HOME are the ones resolved.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	live := t.TempDir()
 	gone := filepath.Join(t.TempDir(), "deleted-worktree")
 	const sid = "cafe0000-1111-2222-3333-444455556666"
@@ -129,6 +141,9 @@ func TestOrphanCwdFallsBackToAnExistingDirectory(t *testing.T) {
 func TestOrphanWithNoSurvivingCwdIsReportedNotResumable(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// The daemon's directory follows CLAUDE_CONFIG_DIR; clear it so the
+	// fixtures under the fake HOME are the ones resolved.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	gone := filepath.Join(t.TempDir(), "deleted-worktree")
 	const sid = "dead0000-1111-2222-3333-444455556666"
 	writeTranscript(t, home, "-tmp-repo", sid, record(gone, ""))
@@ -169,6 +184,9 @@ func TestResumeByCLIRefusesWithoutCwd(t *testing.T) {
 func TestOrphanTitleFallsBackToAgentName(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// The daemon's directory follows CLAUDE_CONFIG_DIR; clear it so the
+	// fixtures under the fake HOME are the ones resolved.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	cwd := t.TempDir()
 	const sid = "f00d0000-1111-2222-3333-444455556666"
 	writeTranscript(t, home, "-tmp-repo", sid,

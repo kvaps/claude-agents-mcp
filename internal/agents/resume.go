@@ -66,11 +66,11 @@ func ReadJobState(short string) (*JobState, error) {
 // controlKey reads the daemon control-socket auth key. The dispatch op is
 // authenticated; attach/list/subscribe are not.
 func controlKey() (string, error) {
-	home, err := os.UserHomeDir()
+	dir, err := configDir()
 	if err != nil {
 		return "", err
 	}
-	b, err := os.ReadFile(filepath.Join(home, ".claude", "daemon", "control.key"))
+	b, err := os.ReadFile(filepath.Join(dir, "daemon", "control.key"))
 	if err != nil {
 		return "", fmt.Errorf("read daemon control key: %w", err)
 	}

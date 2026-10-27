@@ -13,6 +13,9 @@ func fakeSession(t *testing.T) (sid, path string) {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// The daemon's directory follows CLAUDE_CONFIG_DIR; clear it so the
+	// fixtures under the fake HOME are the ones resolved.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	sid = "11111111-2222-3333-4444-555555555555"
 	dir := filepath.Join(home, ".claude", "projects", "-tmp-project")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

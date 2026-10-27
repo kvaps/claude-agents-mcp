@@ -148,6 +148,9 @@ func TestSanitizeProjectPath(t *testing.T) {
 func TestWriteSessionTitle(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// The daemon's directory follows CLAUDE_CONFIG_DIR; clear it so the
+	// fixtures under the fake HOME are the ones resolved.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	sid := "11111111-2222-3333-4444-555555555555"
 	cwd := "/Users/x/proj_one"
 	projDir := filepath.Join(home, ".claude", "projects", sanitizeProjectPath(cwd))

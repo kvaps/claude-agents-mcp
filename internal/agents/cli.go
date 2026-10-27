@@ -250,11 +250,11 @@ func writeSessionTitle(sessionID, cwd, title string) (bool, error) {
 	if sessionID == "" || cwd == "" {
 		return false, nil
 	}
-	home, err := os.UserHomeDir()
+	dir, err := projectsDir()
 	if err != nil {
 		return false, err
 	}
-	path := filepath.Join(home, ".claude", "projects", sanitizeProjectPath(cwd), sessionID+".jsonl")
+	path := filepath.Join(dir, sanitizeProjectPath(cwd), sessionID+".jsonl")
 	if _, err := os.Stat(path); err != nil {
 		return false, nil // no transcript at the guessed path; the job-state name still applies
 	}
