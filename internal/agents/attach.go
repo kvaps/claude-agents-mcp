@@ -96,7 +96,7 @@ func (c *Client) send(short string, data []byte, wait bool, maxWait time.Duratio
 	if strings.TrimSpace(short) == "" {
 		return "", fmt.Errorf("session is not running (no live attach target)")
 	}
-	sock, err := FindSocket()
+	sock, err := c.socket()
 	if err != nil {
 		return "", err
 	}

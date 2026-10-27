@@ -1,9 +1,11 @@
 package agents
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // fakeSession points ~/.claude/projects at a temp dir and returns a session id
@@ -31,7 +33,10 @@ func userRecord(text string) string {
 	return `{"type":"user","message":{"role":"user","content":` + jsonQuote(text) + `},"sessionId":"x"}`
 }
 
-func jsonQuote(s string) string { return `"` + jsonNeedle(s) + `"` }
+func jsonQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
 
 func appendLine(t *testing.T, path, line string) {
 	t.Helper()
@@ -132,8 +137,7 @@ func TestTranscriptMarkWithoutSessionID(t *testing.T) {
 
 // The CLI writes transcripts with JavaScript's JSON.stringify, which leaves <,
 // > and & literal. A prompt whose distinctive line carries them — shell
-// redirects, JSX, boolean &&  — must still be found; the needle must not be
-// HTML-escaped the way Go's json.Marshal does by default.
+// redirects, JSX, boolean && — must still be found.
 func TestTranscriptMatchesHTMLishPrompt(t *testing.T) {
 	sid, path := fakeSession(t)
 	prompt := "Refactor <Component> so a && b > c holds and pipe out > result.log"
@@ -142,31 +146,20 @@ func TestTranscriptMatchesHTMLishPrompt(t *testing.T) {
 	// Mimic Node exactly: <, > and & appear literally in the record.
 	appendLine(t, path, `{"type":"user","message":{"role":"user","content":"`+prompt+`"}}`)
 	if !m.Landed(prompt) {
-		t.Error("a prompt containing <, > or & was not matched — the needle must not HTML-escape")
+		t.Error("a prompt containing <, > or & was not matched")
 	}
 }
 
-func TestJSONNeedleDoesNotHTMLEscape(t *testing.T) {
-	got := jsonNeedle("a < b && c > d")
-	if got != "a < b && c > d" {
-		t.Errorf("jsonNeedle = %q, want the fragment verbatim (no HTML escaping)", got)
+func TestPromptNeedle(t *testing.T) {
+	if got := promptNeedle("short\nthe longest line here\nmid"); got != "the longest line here" {
+		t.Errorf("promptNeedle picked %q", got)
 	}
-	// A control character still has to be escaped the way any JSON writer would.
-	if tab := jsonNeedle("a\tb"); tab != `a\tb` {
-		t.Errorf("jsonNeedle(tab) = %q, want %q", tab, `a\tb`)
-	}
-}
-
-func TestPromptFragment(t *testing.T) {
-	if got := promptFragment("short\nthe longest line here\nmid"); got != "the longest line here" {
-		t.Errorf("promptFragment picked %q", got)
-	}
-	if got := promptFragment("   "); got != "" {
-		t.Errorf("promptFragment of blank text is %q, want empty", got)
+	if got := promptNeedle("   "); got != "" {
+		t.Errorf("promptNeedle of blank text is %q, want empty", got)
 	}
 	long := "x" + string(make([]byte, 0)) + repeat("ю", 300)
-	if got := promptFragment(long); len(got) > 200 || got == "" {
-		t.Errorf("promptFragment did not cap a long line: len=%d", len(got))
+	if got := promptNeedle(long); len(got) > 200 || got == "" {
+		t.Errorf("promptNeedle did not cap a long line: len=%d", len(got))
 	}
 }
 
@@ -176,4 +169,86 @@ func repeat(s string, n int) string {
 		out = append(out, s...)
 	}
 	return string(out)
+}
+
+// The REPL may reflow whitespace on the way into the transcript; the match does
+// not depend on it.
+func TestTranscriptMatchesReflowedWhitespace(t *testing.T) {
+	sid, path := fakeSession(t)
+	prompt := "Fix:\tthe  table\r\nalignment\u00a0in the report  "
+
+	m := markTranscript(sid)
+	appendLine(t, path, userRecord("Fix:    the table\nalignment in the report"))
+	if !m.Landed(prompt) {
+		t.Error("a prompt with reflowed whitespace was not matched")
+	}
+}
+
+// A prompt sent with an image or attachment is recorded as a list of blocks.
+func TestTranscriptMatchesTextBlocks(t *testing.T) {
+	sid, path := fakeSession(t)
+	const prompt = "Describe what the attached screenshot shows."
+
+	m := markTranscript(sid)
+	appendLine(t, path, `{"type":"user","message":{"role":"user","content":[{"type":"image","source":{}},{"type":"text","text":`+jsonQuote(prompt)+`}]}}`)
+	if !m.Landed(prompt) {
+		t.Error("a prompt recorded as text blocks was not matched")
+	}
+}
+
+// "/goal <condition>" is recorded in its command form: the typed line never
+// appears, the condition does.
+func TestTranscriptMatchesSlashCommandArgs(t *testing.T) {
+	sid, path := fakeSession(t)
+	m := markTranscript(sid)
+	appendLine(t, path, userRecord("<command-message>goal</command-message>\n<command-name>/goal</command-name>\n<command-args>every test passes</command-args>"))
+	if !m.Landed("/goal every test passes") {
+		t.Error("a /goal command was not matched on its condition")
+	}
+	if !m.Landed("/goal") {
+		t.Error("a bare command was not matched on its name")
+	}
+}
+
+// What a scan says beyond Landed: the prompt in the CLI's command queue, and
+// records of a turn that is not ours. Meta records the CLI adds of its own are
+// neither.
+func TestTranscriptScanQueueAndForeign(t *testing.T) {
+	sid, path := fakeSession(t)
+	const prompt = "Then update the changelog."
+
+	m := markTranscript(sid)
+	appendLine(t, path, `{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>…</local-command-caveat>"}}`)
+	if s := m.Scan(prompt); s.Foreign || s.Enqueued || s.Landed || !s.Grew {
+		t.Errorf("a meta record: %+v", s)
+	}
+	appendLine(t, path, `{"type":"queue-operation","operation":"enqueue","content":`+jsonQuote(prompt)+`}`)
+	if s := m.Scan(prompt); !s.Enqueued || s.Foreign || s.Landed {
+		t.Errorf("an enqueue of the prompt: %+v", s)
+	}
+	appendLine(t, path, `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"still on it"}]}}`)
+	if s := m.Scan(prompt); !s.Foreign || s.Landed {
+		t.Errorf("an assistant record: %+v", s)
+	}
+}
+
+// A mark adopted after delivery has no offsets, so it reads the whole file and
+// relies on timestamps to ignore what came before.
+func TestTranscriptAdoptedMarkIgnoresOlderRecords(t *testing.T) {
+	sid, path := fakeSession(t)
+	const prompt = "Run the tests and report the failures."
+	stamp := func(at time.Time) string {
+		return `{"type":"user","message":{"role":"user","content":` + jsonQuote(prompt) + `},"timestamp":"` + at.UTC().Format(time.RFC3339Nano) + `"}`
+	}
+	appendLine(t, path, stamp(time.Now().Add(-time.Minute)))
+
+	var m transcriptMark
+	m.adopt(sid, time.Now())
+	if s := m.Scan(prompt); s.Landed || s.Grew {
+		t.Errorf("a record from before the delivery counted: %+v", s)
+	}
+	appendLine(t, path, stamp(time.Now()))
+	if !m.Landed(prompt) {
+		t.Error("the delivered prompt was not found by an adopted mark")
+	}
 }
