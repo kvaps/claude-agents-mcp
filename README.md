@@ -190,15 +190,20 @@ This depends on Claude Code internals that are not a published interface — the
 
 ## What "the turn started" means
 
-`submit_prompt` confirms a delivery against the session transcript where it can: the prompt appearing as a user record in `~/.claude/projects/<project>/<sessionId>.jsonl` is the only evidence that the text reached the conversation. The daemon roster heuristics remain as a fallback for sessions whose transcript cannot be located, and the tool result says which of the two confirmed it.
+`submit_prompt` confirms a delivery against the session transcript where it can: the prompt appearing as a user record in `~/.claude/projects/<project>/<sessionId>.jsonl` is the only evidence that the text reached the conversation. The daemon roster heuristics are consulted only for a session whose transcript cannot be located at all (no session id), and the tool result says which of the two confirmed it.
 
-A prompt that has not (yet) started a turn is reported as one of three distinct states, because the right response differs in each:
+The CLI writes a prompt down only after it has processed it (hooks, attachments) and then on its next transcript flush, while the roster and the screen change the moment the prompt is submitted. So the transcript is polled — backing off from 100 ms to 1 s — for 15 s from the moment the text was sent, longer when a rescue `Enter` is pressed (`CLAUDE_AGENTS_CONFIRM_TIMEOUT` in the server's environment: a Go duration or whole seconds, 1 s–2 min), and the roster does not end that wait. The match is on the prompt's longest line with whitespace runs collapsed, and a slash command such as `/goal` is matched on its arguments, which is how the CLI records it. A prompt that is still not written down when the window runs out but has left the input box and is being worked on is reported as *submitted, not yet in the transcript*: treat it as delivered and do not resubmit.
+
+The rescue `Enter` is only pressed when the text may still be sitting in the input box — not when it has visibly left it and the session is working on it.
+
+A prompt that has not (yet) started a turn is reported as one of four distinct states, because the right response differs in each:
 
 | state | what happened | what to do |
 | --- | --- | --- |
 | blocked on a dialog | a dialog has focus; the prompt never reached the input box | answer the dialog — `on_resume_dialog`, or explicitly |
 | queued | the session was already running a turn; the prompt is in the input box and the REPL will consume it when that turn ends | nothing. Do not retry (it would deliver twice) and do not send `Enter` |
 | stuck | no dialog, no running turn, text unsubmitted in the box | `Enter` is the right recovery — and has already been retried twice by the time this is reported |
+| not delivered | no trace of the prompt: not in the transcript, not in the input box, the session idle | `read_screen` first; resubmit only if the screen confirms it is not being worked on |
 
 ## Agents writing to each other
 
@@ -245,7 +250,7 @@ A Claude Code session receives a message in its conversation: the envelope is su
 | status | session recipient | mailbox recipient |
 | --- | --- | --- |
 | `queued` | in the recipient's input box behind the turn it is running; consumed when that turn ends | stored, not yet fetched by the client |
-| `delivered` | in the recipient's conversation — confirmed against its transcript | fetched by `read_messages` / `wait_for_messages` |
+| `delivered` | in the recipient's conversation — confirmed against its transcript, or submitted and being worked on before the transcript caught up (`delivery` says which) | fetched by `read_messages` / `wait_for_messages` |
 | `read` | never: a session gives no read receipt | acknowledged with `ack_messages` |
 | `failed` | not delivered; the reason says why | the append failed; the reason says why |
 
