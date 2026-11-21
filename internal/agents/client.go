@@ -20,6 +20,11 @@ type Client struct {
 	// resolution. Tests install it to resolve against a fixed fleet without a
 	// daemon; production clients leave it nil.
 	listFn func() ([]Session, error)
+	// sock, when set, is the control socket to use instead of the freshest one
+	// FindSocket locates. Tests point it at a fake daemon.
+	sock string
+	// confirm, when set, overrides the delivery confirmation timings.
+	confirm confirmTimings
 }
 
 // NewClient returns a daemon client. It does not require the daemon to be
@@ -44,9 +49,17 @@ func FindSocket() (string, error) {
 	return matches[0], nil
 }
 
+// socket returns the control socket this client talks to.
+func (c *Client) socket() (string, error) {
+	if c.sock != "" {
+		return c.sock, nil
+	}
+	return FindSocket()
+}
+
 // request sends one newline-framed JSON request and returns the first reply line.
 func (c *Client) request(payload map[string]any) ([]byte, error) {
-	sock, err := FindSocket()
+	sock, err := c.socket()
 	if err != nil {
 		return nil, err
 	}
@@ -304,7 +317,7 @@ func (c *Client) Snapshot(short string, tail int) (Session, string, error) {
 	if strings.TrimSpace(short) == "" {
 		return Session{}, "", fmt.Errorf("session is not running (no live attach target)")
 	}
-	sock, err := FindSocket()
+	sock, err := c.socket()
 	if err != nil {
 		return Session{}, "", err
 	}

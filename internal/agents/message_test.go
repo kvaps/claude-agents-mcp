@@ -83,8 +83,8 @@ func TestEnvelopeQuotesInNames(t *testing.T) {
 func TestEnvelopeConfirmationIsPerMessage(t *testing.T) {
 	for _, body := range []string{"ok", "please rerun the failing test and tell me what it says"} {
 		t.Run(body[:2], func(t *testing.T) {
-			first := promptFragment(envelope("m-aaaaaa", testSender, testRecipient, body, testAt))
-			second := promptFragment(envelope("m-bbbbbb", testSender, testRecipient, body, testAt))
+			first := promptNeedle(envelope("m-aaaaaa", testSender, testRecipient, body, testAt))
+			second := promptNeedle(envelope("m-bbbbbb", testSender, testRecipient, body, testAt))
 			if first == second {
 				t.Fatalf("two distinct messages share a confirmation needle: %q", first)
 			}
