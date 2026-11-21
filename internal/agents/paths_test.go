@@ -88,7 +88,7 @@ func TestFindSocketPrefersOwnDaemon(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Skipf("cannot create socket dir: %v", err)
 		}
-		t.Cleanup(func() { os.RemoveAll(dir) })
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
 		if err := os.WriteFile(filepath.Join(dir, "control.sock"), nil, 0o600); err != nil {
 			t.Fatalf("write socket placeholder: %v", err)
 		}
