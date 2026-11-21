@@ -17,11 +17,11 @@ func transcriptFiles(sid string) []string {
 	if sid == "" {
 		return nil
 	}
-	home, err := os.UserHomeDir()
+	dir, err := projectsDir()
 	if err != nil {
 		return nil
 	}
-	matches, _ := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", sid+".jsonl"))
+	matches, _ := filepath.Glob(filepath.Join(dir, "*", sid+".jsonl"))
 	return matches
 }
 

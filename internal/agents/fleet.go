@@ -24,13 +24,13 @@ import (
 // (lower = higher in the list). pin_session and reorder_session below write
 // exactly these files, matching what ctrl+t and shift+↑/↓ do in the picker.
 
-// jobsDir returns ~/.claude/jobs, where the agents view keeps its state.
+// jobsDir returns the jobs directory, where the agents view keeps its state.
 func jobsDir() (string, error) {
-	home, err := os.UserHomeDir()
+	dir, err := configDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".claude", "jobs"), nil
+	return filepath.Join(dir, "jobs"), nil
 }
 
 func pinsPath() (string, error) {
